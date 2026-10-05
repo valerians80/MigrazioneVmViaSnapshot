@@ -1,23 +1,19 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    Deploys (or removes) a small two-subscription test environment for Invoke-VmSkuMigration.ps1.
+    Deploys (or removes) a small test environment for Invoke-VmSkuMigration.ps1 in ONE subscription.
 
 .DESCRIPTION
-    Subscription A ("network")  : resource group with the HUB VNet (10.250.0.0/16).
-    Subscription B ("compute")  : resource group with a SPOKE VNet (10.251.0.0/16, subnet 10.251.1.0/24), peered
-                                  both ways with the hub, and one VM of a retiring family (default Standard_B2ms)
-                                  with its NIC (static private IP, NSG), an optional public IP, data disk(s) and
-                                  one extension.
+    One subscription, two resource groups:
+      rg-<prefix>-net : a VNet (10.250.0.0/16) with one subnet (10.250.1.0/24)
+      rg-<prefix>-vm  : one VM of a retiring family (default Standard_B2ms) with its NIC (static private IP, on the
+                        subnet of the network resource group), NSG, an optional public IP, data disk(s) and one
+                        extension.
 
-    Everything is created through prompts (tenant, the two subscriptions, VM credentials). Nothing is hard-coded.
+    Everything is created through prompts (tenant, subscription, VM credentials). Nothing is hard-coded.
     Both resource groups are tagged purpose=migration-test, and -Destroy only deletes resource groups carrying
-    that tag. The deployment is recorded in testenv.json next to this script.
-
-    Why a peering: a NIC cannot use a subnet that lives in another subscription (Azure answers "referenced
-    resource was not found"), so the VM's subnet must be in the VM's own subscription. The hub/spoke peering is
-    the usual landing-zone layout. Peering across subscriptions needs both in the same tenant and Network
-    Contributor (or Contributor) on both.
+    that tag. The deployment is recorded in testenv.json next to this script. The script can be re-run after a
+    partial failure: tagged resource groups and an existing VNet / NSG are reused.
 
 .PARAMETER Destroy
     Deletes the two resource groups recorded in testenv.json (after you type DELETE).
@@ -29,7 +25,7 @@
 .PARAMETER Zone
     Optional availability zone (1, 2 or 3).
 .PARAMETER PrivateIp
-    Static private IP in the spoke subnet 10.251.1.0/24. Empty = dynamic.
+    Static private IP in the subnet 10.250.1.0/24. Empty = dynamic.
 .PARAMETER WithPublicIp
     Adds a Standard static public IP to the NIC.
 .PARAMETER WithSystemIdentity
@@ -42,8 +38,7 @@
 [CmdletBinding()]
 param(
     [string]$TenantId,
-    [string]$NetworkSubscriptionId,
-    [string]$ComputeSubscriptionId,
+    [string]$SubscriptionId,
     [string]$Location = 'westeurope',
     [string]$Prefix = 'migtest',
     [string]$VmName,
@@ -52,7 +47,7 @@ param(
     [ValidateSet(1, 2)][int]$Generation = 2,
     [ValidateSet('', '1', '2', '3')][string]$Zone = '',
     [ValidateRange(0, 8)][int]$DataDiskCount = 1,
-    [string]$PrivateIp = '10.251.1.10',
+    [string]$PrivateIp = '10.250.1.10',
     [switch]$WithPublicIp,
     [switch]$WithSystemIdentity,
     [switch]$WithHybridBenefit,
@@ -63,10 +58,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$HubAddressSpace = '10.250.0.0/16'
-$HubSubnetPrefix = '10.250.1.0/24'
-$SpokeAddressSpace = '10.251.0.0/16'
-$SpokeSubnetPrefix = '10.251.1.0/24'
+$VnetAddressSpace = '10.250.0.0/16'
+$SubnetPrefix = '10.250.1.0/24'
 $TestTag = @{ purpose = 'migration-test' }
 
 # ---------------------------------------------------------------------------------------------------------
@@ -159,17 +152,17 @@ if ($Destroy) {
     $state = Get-Content -Raw $StatePath | ConvertFrom-Json
     Write-Host ''
     Write-Host "This DELETES, with everything inside (including any -mig resources created by the migration test):"
-    Write-Host "  subscription $($state.computeSubscriptionId) : resource group $($state.computeResourceGroup)"
-    Write-Host "  subscription $($state.networkSubscriptionId) : resource group $($state.networkResourceGroup)"
+    Write-Host "  subscription $($state.subscriptionId) : resource group $($state.vmResourceGroup)"
+    Write-Host "  subscription $($state.subscriptionId) : resource group $($state.networkResourceGroup)"
     if (-not (Confirm-Typed 'Delete both resource groups?' 'DELETE')) { Write-Host 'Cancelled.'; return }
-    foreach ($t in @(@{ s = $state.computeSubscriptionId; r = $state.computeResourceGroup }, @{ s = $state.networkSubscriptionId; r = $state.networkResourceGroup })) {
-        Invoke-InSubscription $t.s {
-            $rg = Get-AzResourceGroup -Name $t.r -ErrorAction SilentlyContinue
-            if (-not $rg) { Write-Step "$($t.r) not found, nothing to do." 'Yellow'; return }
-            if (-not ($rg.Tags -and $rg.Tags['purpose'] -eq 'migration-test')) { Write-Step "$($t.r) is not tagged purpose=migration-test: NOT deleted." 'Red'; return }
-            Write-Step "Deleting $($t.r) ..."
-            Remove-AzResourceGroup -Name $t.r -Force | Out-Null
-            Write-Step "Deleted $($t.r)" 'Green'
+    foreach ($rgName in @($state.vmResourceGroup, $state.networkResourceGroup)) {
+        Invoke-InSubscription $state.subscriptionId {
+            $rg = Get-AzResourceGroup -Name $rgName -ErrorAction SilentlyContinue
+            if (-not $rg) { Write-Step "$rgName not found, nothing to do." 'Yellow'; return }
+            if (-not ($rg.Tags -and $rg.Tags['purpose'] -eq 'migration-test')) { Write-Step "$rgName is not tagged purpose=migration-test: NOT deleted." 'Red'; return }
+            Write-Step "Deleting $rgName ..."
+            Remove-AzResourceGroup -Name $rgName -Force | Out-Null
+            Write-Step "Deleted $rgName" 'Green'
         }
     }
     Remove-Item $StatePath -Force
@@ -179,19 +172,15 @@ if ($Destroy) {
 # ---------------------------------------------------------------------------------------------------------
 # deploy
 # ---------------------------------------------------------------------------------------------------------
-$netSub = Select-Subscription -Subscriptions $subs -Role 'NETWORK (VNet / subnet)' -Preset $NetworkSubscriptionId
-$vmSub = Select-Subscription -Subscriptions $subs -Role 'COMPUTE (VM)' -Preset $ComputeSubscriptionId
-if ($netSub.Id -eq $vmSub.Id) { throw 'The network and the compute subscription must be different.' }
-if ($PrivateIp -and -not $PrivateIp.StartsWith('10.251.1.')) { throw "PrivateIp must be inside $SpokeSubnetPrefix (or empty for dynamic)." }
+$sub = Select-Subscription -Subscriptions $subs -Role 'test' -Preset $SubscriptionId
+if ($PrivateIp -and -not $PrivateIp.StartsWith('10.250.1.')) { throw "PrivateIp must be inside $SubnetPrefix (or empty for dynamic)." }
 if (-not $VmName) { $VmName = "vm${Prefix}01" }
 if ($OsType -eq 'Windows' -and $VmName.Length -gt 15) { throw 'On Windows the VM name can be at most 15 characters.' }
 if ($WithHybridBenefit -and $OsType -ne 'Windows') { throw '-WithHybridBenefit only applies to Windows.' }
 
 $netRg = "rg-$Prefix-net"
 $vmRg = "rg-$Prefix-vm"
-$hubName = "vnet-$Prefix-hub"
-$hubSubnetName = 'snet-hub'
-$spokeName = "vnet-$Prefix-spoke"
+$vnetName = "vnet-$Prefix"
 $subnetName = 'snet-workload'
 $nsgName = "nsg-$Prefix"
 $nicName = "nic-$VmName"
@@ -208,8 +197,9 @@ else {
 Write-Host ''
 Write-Host 'Plan:' -ForegroundColor Cyan
 Write-Host "  Tenant        : $TenantId"
-Write-Host "  Network sub   : $($netSub.Name) ($($netSub.Id))  -> $netRg / hub $hubName ($HubAddressSpace)"
-Write-Host "  Compute sub   : $($vmSub.Name) ($($vmSub.Id))  -> $vmRg / spoke $spokeName / $subnetName ($SpokeSubnetPrefix), peered with the hub"
+Write-Host "  Subscription  : $($sub.Name) ($($sub.Id))"
+Write-Host "  Network RG    : $netRg  -> $vnetName ($VnetAddressSpace) / $subnetName ($SubnetPrefix)"
+Write-Host "  VM RG         : $vmRg"
 Write-Host "  VM            : $VmName  $VmSize  $OsType Gen$Generation  zone '$Zone'  in $Location"
 Write-Host "  NIC           : $nicName  IP $(if ($PrivateIp) { $PrivateIp + ' (static)' } else { 'dynamic' })  NSG $nsgName  public IP: $([bool]$WithPublicIp)"
 Write-Host "  Extras        : $DataDiskCount data disk(s), identity: $([bool]$WithSystemIdentity), AHB: $([bool]$WithHybridBenefit), extension: $(-not $SkipExtension)"
@@ -218,12 +208,10 @@ if ((Read-Host 'Deploy? [y/N]').Trim() -notmatch '^(y|yes)$') { Write-Host 'Canc
 
 $cred = Get-Credential -Message 'Local administrator credentials for the test VM (not stored anywhere)'
 
-# providers
-Register-Provider -SubscriptionId $netSub.Id -Namespaces @('Microsoft.Network')
-Register-Provider -SubscriptionId $vmSub.Id -Namespaces @('Microsoft.Network', 'Microsoft.Compute')
+Register-Provider -SubscriptionId $sub.Id -Namespaces @('Microsoft.Network', 'Microsoft.Compute')
 
-# pre-checks in the compute subscription
-Invoke-InSubscription $vmSub.Id {
+Invoke-InSubscription $sub.Id {
+    # pre-checks
     $skuInfo = Get-AzComputeResourceSku -Location $Location | Where-Object { $_.ResourceType -eq 'virtualMachines' -and $_.Name -eq $VmSize } | Select-Object -First 1
     if (-not $skuInfo) { throw "Size $VmSize is not offered in $Location." }
     foreach ($r in $skuInfo.Restrictions) {
@@ -236,44 +224,21 @@ Invoke-InSubscription $vmSub.Id {
     Write-Step "Pre-checks ok (size available, image $($image.Sku) $($img.Version))" 'Green'
 }
 
-# --- subscription A: hub network ---
-Ensure-TestResourceGroup -SubscriptionId $netSub.Id -Name $netRg
-Invoke-InSubscription $netSub.Id {
-    $hub = Get-AzVirtualNetwork -ResourceGroupName $netRg -Name $hubName -ErrorAction SilentlyContinue
-    if (-not $hub) {
-        $sn = New-AzVirtualNetworkSubnetConfig -Name $hubSubnetName -AddressPrefix $HubSubnetPrefix
-        New-AzVirtualNetwork -Name $hubName -ResourceGroupName $netRg -Location $Location -AddressPrefix $HubAddressSpace -Subnet $sn -Tag $tags | Out-Null
-        Write-Step "Created hub VNet $hubName"
+# --- network resource group ---
+Ensure-TestResourceGroup -SubscriptionId $sub.Id -Name $netRg
+$subnetId = Invoke-InSubscription $sub.Id {
+    $vnet = Get-AzVirtualNetwork -ResourceGroupName $netRg -Name $vnetName -ErrorAction SilentlyContinue
+    if (-not $vnet) {
+        $sn = New-AzVirtualNetworkSubnetConfig -Name $subnetName -AddressPrefix $SubnetPrefix
+        $vnet = New-AzVirtualNetwork -Name $vnetName -ResourceGroupName $netRg -Location $Location -AddressPrefix $VnetAddressSpace -Subnet $sn -Tag $tags
+        Write-Step "Created VNet $vnetName with subnet $subnetName"
     }
+    ($vnet.Subnets | Where-Object { $_.Name -eq $subnetName }).Id
 }
 
-# --- subscription B: compute ---
-Ensure-TestResourceGroup -SubscriptionId $vmSub.Id -Name $vmRg
-$hubId = "/subscriptions/$($netSub.Id)/resourceGroups/$netRg/providers/Microsoft.Network/virtualNetworks/$hubName"
-$spokeId = "/subscriptions/$($vmSub.Id)/resourceGroups/$vmRg/providers/Microsoft.Network/virtualNetworks/$spokeName"
-$subnetId = Invoke-InSubscription $vmSub.Id {
-    $spoke = Get-AzVirtualNetwork -ResourceGroupName $vmRg -Name $spokeName -ErrorAction SilentlyContinue
-    if (-not $spoke) {
-        $sn = New-AzVirtualNetworkSubnetConfig -Name $subnetName -AddressPrefix $SpokeSubnetPrefix
-        $spoke = New-AzVirtualNetwork -Name $spokeName -ResourceGroupName $vmRg -Location $Location -AddressPrefix $SpokeAddressSpace -Subnet $sn -Tag $tags
-        Write-Step "Created spoke VNet $spokeName with subnet $subnetName"
-    }
-    ($spoke.Subnets | Where-Object { $_.Name -eq $subnetName }).Id
-}
-
-# peering, both directions
-foreach ($side in @(@{ Sub = $vmSub.Id; Rg = $vmRg; Vnet = $spokeName; Name = "peer-$Prefix-spoke-to-hub"; Remote = $hubId }, @{ Sub = $netSub.Id; Rg = $netRg; Vnet = $hubName; Name = "peer-$Prefix-hub-to-spoke"; Remote = $spokeId })) {
-    Invoke-InSubscription $side.Sub {
-        $existing = Get-AzVirtualNetworkPeering -VirtualNetworkName $side.Vnet -ResourceGroupName $side.Rg -Name $side.Name -ErrorAction SilentlyContinue
-        if (-not $existing) {
-            $v = Get-AzVirtualNetwork -ResourceGroupName $side.Rg -Name $side.Vnet
-            Add-AzVirtualNetworkPeering -Name $side.Name -VirtualNetwork $v -RemoteVirtualNetworkId $side.Remote -AllowForwardedTraffic | Out-Null
-            Write-Step "Created peering $($side.Name)"
-        }
-    }
-}
-
-Invoke-InSubscription $vmSub.Id {
+# --- VM resource group ---
+Ensure-TestResourceGroup -SubscriptionId $sub.Id -Name $vmRg
+Invoke-InSubscription $sub.Id {
     $nsg = Get-AzNetworkSecurityGroup -ResourceGroupName $vmRg -Name $nsgName -ErrorAction SilentlyContinue
     if (-not $nsg) { $nsg = New-AzNetworkSecurityGroup -Name $nsgName -ResourceGroupName $vmRg -Location $Location -Tag $tags; Write-Step "Created NSG $nsgName (default rules, no inbound from the internet)" }
 
@@ -284,13 +249,8 @@ Invoke-InSubscription $vmSub.Id {
         $ipParams.PublicIpAddressId = $pip.Id
         Write-Step "Created public IP $pipName ($($pip.IpAddress))"
     }
-    try {
-        $nic = New-AzNetworkInterface -Name $nicName -ResourceGroupName $vmRg -Location $Location -IpConfiguration (New-AzNetworkInterfaceIpConfig @ipParams) -NetworkSecurityGroup $nsg -Tag $tags -Force
-    }
-    catch {
-        throw "NIC creation failed: $($_.Exception.Message)"
-    }
-    Write-Step "Created NIC $nicName ($($nic.IpConfigurations[0].PrivateIpAddress)) on the spoke subnet"
+    $nic = New-AzNetworkInterface -Name $nicName -ResourceGroupName $vmRg -Location $Location -IpConfiguration (New-AzNetworkInterfaceIpConfig @ipParams) -NetworkSecurityGroup $nsg -Tag $tags -Force
+    Write-Step "Created NIC $nicName ($($nic.IpConfigurations[0].PrivateIpAddress)) on the subnet of $netRg"
 
     $cfg = @{ VMName = $VmName; VMSize = $VmSize; Tags = $tags }
     if ($Zone) { $cfg.Zone = @($Zone) }
@@ -325,19 +285,17 @@ Invoke-InSubscription $vmSub.Id {
 
 # --- record and hand over ---
 [ordered]@{
-    tenantId              = $TenantId
-    networkSubscriptionId = $netSub.Id
-    computeSubscriptionId = $vmSub.Id
-    networkResourceGroup  = $netRg
-    computeResourceGroup  = $vmRg
-    hubVnet               = $hubName
-    spokeVnet             = $spokeName
-    subnetId              = $subnetId
-    vmName                = $VmName
-    vmSize                = $VmSize
-    location              = $Location
-    privateIp             = $PrivateIp
-    createdAt             = (Get-Date).ToString('o')
+    tenantId             = $TenantId
+    subscriptionId       = $sub.Id
+    networkResourceGroup = $netRg
+    vmResourceGroup      = $vmRg
+    vnet                 = $vnetName
+    subnetId             = $subnetId
+    vmName               = $VmName
+    vmSize               = $VmSize
+    location             = $Location
+    privateIp            = $PrivateIp
+    createdAt            = (Get-Date).ToString('o')
 } | ConvertTo-Json | Set-Content -Path $StatePath -Encoding utf8
 
 Write-Host ''
@@ -345,8 +303,8 @@ Write-Step 'Test environment ready.' 'Green'
 Write-Host "State saved to $StatePath"
 Write-Host ''
 Write-Host 'Run the migration against it:' -ForegroundColor Cyan
-Write-Host "  pwsh .\Invoke-VmSkuMigration.ps1 -TenantId $TenantId -SubscriptionId $($vmSub.Id) -ResourceGroupName $vmRg -VmName $VmName"
-Write-Host 'Pick a placeholder IP in 10.251.1.0/24, e.g. 10.251.1.50.'
+Write-Host "  pwsh .\Invoke-VmSkuMigration.ps1 -TenantId $TenantId -SubscriptionId $($sub.Id) -ResourceGroupName $vmRg -VmName $VmName"
+Write-Host 'Pick a placeholder IP in 10.250.1.0/24, e.g. 10.250.1.50.'
 Write-Host ''
 Write-Host 'Remove everything afterwards:' -ForegroundColor Cyan
 Write-Host "  pwsh .\testenv\New-MigrationTestEnvironment.ps1 -Destroy -TenantId $TenantId"

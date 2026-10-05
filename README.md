@@ -72,17 +72,14 @@ enable backup on the new VM once the old backup item is dealt with.
 - The replacement VM uses managed boot diagnostics.
 - Rollback deletes the new VM/NICs; it does not offer a "park the new NIC on a placeholder" variant.
 
-## Test environment (two subscriptions)
+## Test environment (one subscription)
 
-`testenv/New-MigrationTestEnvironment.ps1` deploys a disposable environment through prompts (tenant, the two
-subscriptions, VM admin credentials):
+`testenv/New-MigrationTestEnvironment.ps1` deploys a disposable environment through prompts (tenant, subscription,
+VM admin credentials), in one subscription and two resource groups:
 
-- subscription A: resource group with a hub VNet (`10.250.0.0/16`)
-- subscription B: resource group with a spoke VNet (`10.251.0.0/16`, subnet `10.251.1.0/24`) peered both ways with
-  the hub, and a Bv1 VM (default `Standard_B2ms`) with static private IP, NSG, one data disk and one extension
-
-A NIC cannot use a subnet from another subscription, so the VM's subnet lives in its own subscription and the two
-VNets are peered (the usual hub/spoke landing-zone layout).
+- `rg-migtest-net`: a VNet (`10.250.0.0/16`) with one subnet (`10.250.1.0/24`)
+- `rg-migtest-vm`: a Bv1 VM (default `Standard_B2ms`) whose NIC uses the subnet of the network resource group
+  (static private IP, NSG), one data disk and one extension
 
 ```powershell
 pwsh .\testenv\New-MigrationTestEnvironment.ps1                  # Windows Server 2022 Gen2, B2ms
@@ -94,14 +91,13 @@ pwsh .\testenv\New-MigrationTestEnvironment.ps1 -Destroy         # removes both 
 ```
 
 The script prints the exact command to run the migration against it and saves the deployment in `testenv.json`.
-It can be re-run after a partial failure: tagged resource groups and existing VNets/NSG are reused.
+It can be re-run after a partial failure: tagged resource groups and an existing VNet / NSG are reused.
 Both resource groups are tagged `purpose=migration-test`; `-Destroy` only deletes groups carrying that tag.
 Run `-Destroy` when finished: a running B2ms VM costs a few cents per hour.
 
-Requirements: both subscriptions in the same tenant and Network Contributor (or Contributor) on both for the
-peering. `Microsoft.Network` / `Microsoft.Compute` are registered by the script if needed.
-The migration script also switches subscription context by itself when a NSG, public IP or VNet it needs lives in
-another subscription.
+Note: a NIC cannot use a subnet that lives in another subscription (Azure answers `InvalidResourceReference`), so
+the whole environment is in one subscription. The migration script still switches subscription context by itself
+when a NSG, public IP or VNet it needs lives elsewhere.
 
 ## Tests
 
