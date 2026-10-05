@@ -1009,9 +1009,11 @@ function Invoke-Phase3 {
                 $dp.OsType = $d.osType
                 if ($d.hyperVGeneration) { $dp.HyperVGeneration = $d.hyperVGeneration }
             }
-            $diskCfg = New-AzDiskConfig @dp
-            if ($isOs -and $d.securityType) { $diskCfg = Set-AzDiskSecurityProfile -Disk $diskCfg -SecurityType $d.securityType }
-            $new = New-AzDisk -ResourceGroupName $d.resourceGroup -DiskName $diskName -Disk $diskCfg
+            # The security type (e.g. TrustedLaunch) cannot be set with CreateOption Copy: the disk inherits it from the snapshot.
+            $new = New-AzDisk -ResourceGroupName $d.resourceGroup -DiskName $diskName -Disk (New-AzDiskConfig @dp)
+            if ($isOs -and ([string]$new.SecurityProfile.SecurityType) -ne $d.securityType) {
+                Write-Log "New OS disk security type is '$($new.SecurityProfile.SecurityType)', source was '$($d.securityType)'. Check it before using the replacement VM." 'WARN'
+            }
             $st.created.disks += $new.Id
             $st.created.diskIds[$d.name] = $new.Id
             Write-Log "Mapping: snapshot $(Split-Path $snapId -Leaf) -> disk $diskName -> LUN $(if ($isOs) { 'OS' } else { $d.lun })"

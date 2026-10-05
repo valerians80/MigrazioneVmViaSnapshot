@@ -68,9 +68,8 @@ function Remove-AzVM { param($ResourceGroupName, $Name, [switch]$Force) Rec "rem
 function Update-AzVM { param($ResourceGroupName, $VM) Rec 'update-vm' }
 function Get-AzDisk { param($ResourceGroupName, $DiskName) $d = $global:Az.disks[$DiskName]; if (-not $d) { throw "ResourceNotFound disk $DiskName" }; $d }
 function New-AzDiskConfig { param($Location, $CreateOption, $SourceResourceId, $SkuName, $DiskSizeGB, $Zone, $Tag, $DiskEncryptionSetId, $EncryptionType, $OsType, $HyperVGeneration) @{ sku = $SkuName; size = $DiskSizeGB; zone = $Zone; os = $OsType; gen = $HyperVGeneration; sec = $null; tag = $Tag } }
-function Set-AzDiskSecurityProfile { param($Disk, $SecurityType) $Disk.sec = $SecurityType; $Disk }
 function New-AzDisk { param($ResourceGroupName, $DiskName, $Disk) Rec "new-disk $DiskName"
-    $global:Az.disks[$DiskName] = O @{ Name = $DiskName; Id = "$sub/Microsoft.Compute/disks/$DiskName"; Sku = (O @{ Name = $Disk.sku }); DiskSizeGB = $Disk.size; Zones = @($Disk.zone); OsType = $Disk.os; HyperVGeneration = $Disk.gen; SecurityProfile = $null; Encryption = $null; Tags = $Disk.tag }
+    $global:Az.disks[$DiskName] = O @{ Name = $DiskName; Id = "$sub/Microsoft.Compute/disks/$DiskName"; Sku = (O @{ Name = $Disk.sku }); DiskSizeGB = $Disk.size; Zones = @($Disk.zone); OsType = $Disk.os; HyperVGeneration = $Disk.gen; SecurityProfile = $(if ($Disk.os) { O @{ SecurityType = 'TrustedLaunch' } }); Encryption = $null; Tags = $Disk.tag }
     $global:Az.disks[$DiskName] }
 function Remove-AzDisk { param($ResourceGroupName, $DiskName, [switch]$Force) Rec "remove-disk $DiskName"; $global:Az.disks.Remove($DiskName) }
 function New-AzSnapshotConfig { param($SourceUri, $Location, $CreateOption, $SkuName, $Tag, $HyperVGeneration) @{ src = $SourceUri } }
