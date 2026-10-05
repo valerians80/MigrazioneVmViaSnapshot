@@ -1008,9 +1008,10 @@ function Invoke-Phase3 {
             if ($isOs) {
                 $dp.OsType = $d.osType
                 if ($d.hyperVGeneration) { $dp.HyperVGeneration = $d.hyperVGeneration }
-                if ($d.securityType) { $dp.SecurityType = $d.securityType }
             }
-            $new = New-AzDisk -ResourceGroupName $d.resourceGroup -DiskName $diskName -Disk (New-AzDiskConfig @dp)
+            $diskCfg = New-AzDiskConfig @dp
+            if ($isOs -and $d.securityType) { $diskCfg = Set-AzDiskSecurityProfile -Disk $diskCfg -SecurityType $d.securityType }
+            $new = New-AzDisk -ResourceGroupName $d.resourceGroup -DiskName $diskName -Disk $diskCfg
             $st.created.disks += $new.Id
             $st.created.diskIds[$d.name] = $new.Id
             Write-Log "Mapping: snapshot $(Split-Path $snapId -Leaf) -> disk $diskName -> LUN $(if ($isOs) { 'OS' } else { $d.lun })"
