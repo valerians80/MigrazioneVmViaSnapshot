@@ -185,6 +185,18 @@ function Test-ResourceExists {
     }
 }
 
+function Invoke-InSubscription {
+    # Network resources (VNet/subnet, NSG, public IP) can live in another subscription than the VM.
+    # Az cmdlets only look in the current context, so switch for the call and switch back afterwards.
+    param([Parameter(Mandatory)][string]$SubscriptionId, [Parameter(Mandatory)][scriptblock]$Script)
+    $ctx = Get-AzContext
+    if ($ctx.Subscription.Id -eq $SubscriptionId) { return (& $Script) }
+    Write-Log "Switching context to subscription $SubscriptionId for a lookup."
+    Set-AzContext -SubscriptionId $SubscriptionId -Tenant $ctx.Tenant.Id | Out-Null
+    try { return (& $Script) }
+    finally { Set-AzContext -SubscriptionId $ctx.Subscription.Id -Tenant $ctx.Tenant.Id | Out-Null }
+}
+
 function ConvertTo-PlainHashtable {
     param($Dictionary)
     $h = @{}
@@ -570,7 +582,7 @@ function Invoke-Phase1 {
             $pipRecord = $null
             if ($ic.PublicIpAddress) {
                 $pp = Split-ResourceId $ic.PublicIpAddress.Id
-                $pip = Get-AzPublicIpAddress -ResourceGroupName $pp.ResourceGroup -Name $pp.Name
+                $pip = Invoke-InSubscription $pp.Subscription { Get-AzPublicIpAddress -ResourceGroupName $pp.ResourceGroup -Name $pp.Name }
                 $pipRecord = [ordered]@{
                     id = $pip.Id; name = $pip.Name; sku = [string]$pip.Sku.Name
                     allocation = [string]$pip.PublicIpAllocationMethod; address = $pip.IpAddress
@@ -772,10 +784,12 @@ function Invoke-Phase2 {
             if ($existing -and (Confirm-Action "Keep placeholder $existing for $key?" -DefaultYes)) { $placeholders[$key] = $existing; $used += $existing; continue }
 
             $sn = Split-ResourceId $i.subnetId
-            $vnet = Get-AzVirtualNetwork -ResourceGroupName $sn.ResourceGroup -Name $sn.Name
             $subnetName = ($sn.Rest -split '/')[1]
-            $prefixes = @((Get-AzVirtualNetworkSubnetConfig -VirtualNetwork $vnet -Name $subnetName).AddressPrefix)
-            $probe = Test-AzPrivateIPAddressAvailability -ResourceGroupName $sn.ResourceGroup -VirtualNetworkName $sn.Name -IPAddress $i.privateIp
+            $prefixes = @(Invoke-InSubscription $sn.Subscription {
+                    $vnet = Get-AzVirtualNetwork -ResourceGroupName $sn.ResourceGroup -Name $sn.Name
+                    (Get-AzVirtualNetworkSubnetConfig -VirtualNetwork $vnet -Name $subnetName).AddressPrefix
+                })
+            $probe = Invoke-InSubscription $sn.Subscription { Test-AzPrivateIPAddressAvailability -ResourceGroupName $sn.ResourceGroup -VirtualNetworkName $sn.Name -IPAddress $i.privateIp }
             if ($probe.AvailableIPAddresses) { Write-Log "Free addresses suggested by Azure: $($probe.AvailableIPAddresses -join ', ')" }
 
             while ($true) {
@@ -784,7 +798,7 @@ function Invoke-Phase2 {
                 if (-not [ipaddress]::TryParse($ip, [ref]$parsed)) { Write-Log 'Not a valid IP address.' 'WARN'; continue }
                 if ($ip -eq $i.privateIp -or $ip -in $used) { Write-Log 'Must differ from the original IP and from the other placeholders.' 'WARN'; continue }
                 if (-not ($prefixes | Where-Object { Test-IpInCidr -Ip $ip -Cidr $_ })) { Write-Log 'Address is outside the subnet.' 'WARN'; continue }
-                $res = Test-AzPrivateIPAddressAvailability -ResourceGroupName $sn.ResourceGroup -VirtualNetworkName $sn.Name -IPAddress $ip
+                $res = Invoke-InSubscription $sn.Subscription { Test-AzPrivateIPAddressAvailability -ResourceGroupName $sn.ResourceGroup -VirtualNetworkName $sn.Name -IPAddress $ip }
                 if (-not $res.Available) { Write-Log "Address is not available. Suggested: $($res.AvailableIPAddresses -join ', ')" 'WARN'; continue }
                 break
             }
@@ -836,7 +850,7 @@ function Set-SourceNicState {
             $ic.PrivateIpAllocationMethod = $rec.allocation
             if ($rec.publicIpId) {
                 $pp = Split-ResourceId $rec.publicIpId
-                $ic.PublicIpAddress = Get-AzPublicIpAddress -ResourceGroupName $pp.ResourceGroup -Name $pp.Name
+                $ic.PublicIpAddress = Invoke-InSubscription $pp.Subscription { Get-AzPublicIpAddress -ResourceGroupName $pp.ResourceGroup -Name $pp.Name }
             }
         }
     }
@@ -868,7 +882,7 @@ function New-ReplacementNic {
     }
     if ($NicRecord.nsgId) {
         $ns = Split-ResourceId $NicRecord.nsgId
-        $np.NetworkSecurityGroup = Get-AzNetworkSecurityGroup -ResourceGroupName $ns.ResourceGroup -Name $ns.Name
+        $np.NetworkSecurityGroup = Invoke-InSubscription $ns.Subscription { Get-AzNetworkSecurityGroup -ResourceGroupName $ns.ResourceGroup -Name $ns.Name }
     }
     if ($NicRecord.acceleratedNetworking) { $np.EnableAcceleratedNetworking = $true }
     if ($NicRecord.ipForwarding) { $np.EnableIPForwarding = $true }

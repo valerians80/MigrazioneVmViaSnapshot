@@ -19,7 +19,7 @@ Assert (-not $bad) 'name too long rejected'
 $global:Az = @{ vms = @{}; disks = @{}; snaps = @{}; nics = @{}; locks = @(); calls = [System.Collections.Generic.List[string]]::new() }
 function Rec($m) { $global:Az.calls.Add($m) }
 $sub = '/subscriptions/s1/resourceGroups/rg1/providers'
-$subnetId = "$sub/Microsoft.Network/virtualNetworks/vnet1/subnets/sn1"
+$subnetId = "/subscriptions/s2/resourceGroups/rg-net/providers/Microsoft.Network/virtualNetworks/vnet1/subnets/sn1"   # subnet in ANOTHER subscription
 $pipId = "$sub/Microsoft.Network/publicIPAddresses/pip1"
 $nsgId = "$sub/Microsoft.Network/networkSecurityGroups/nsg1"
 $poolId = "$sub/Microsoft.Network/loadBalancers/lb1/backendAddressPools/pool1"
@@ -55,7 +55,9 @@ $global:Az.vms['vm1'] = [pscustomobject]@{
     NetworkProfile = (O @{ NetworkInterfaces = @(O @{ Id = "$sub/Microsoft.Network/networkInterfaces/nic1"; Primary = $true; DeleteOption = 'Detach' }) })
 }
 
-function Get-AzContext { O @{ Account = (O @{ Id = 'tester@x' }); Tenant = (O @{ Id = 't1' }); Subscription = (O @{ Id = 's1'; Name = 'sub' }) } }
+$global:CurSub = 's1'
+function Get-AzContext { O @{ Account = (O @{ Id = 'tester@x' }); Tenant = (O @{ Id = 't1' }); Subscription = (O @{ Id = $global:CurSub; Name = 'sub' }) } }
+function Set-AzContext { param($SubscriptionId, $Tenant) Rec "ctx $SubscriptionId"; $global:CurSub = $SubscriptionId }
 function Get-AzVM { param($ResourceGroupName, $Name, [switch]$Status)
     $v = $global:Az.vms[$Name]; if (-not $v) { throw "ResourceNotFound: VM $Name" }
     if ($Status) { return O @{ Statuses = @(O @{ Code = "PowerState/$($v.Power)" }) } }
@@ -89,9 +91,10 @@ function New-AzNetworkInterface { param($Name, $ResourceGroupName, $Location, $I
 function Get-AzNetworkSecurityGroup { param($ResourceGroupName, $Name) O @{ Id = "$sub/Microsoft.Network/networkSecurityGroups/$Name" } }
 function Get-AzPublicIpAddress { param($ResourceGroupName, $Name) O @{ Id = "$sub/Microsoft.Network/publicIPAddresses/$Name"; Name = $Name; Sku = (O @{ Name = 'Standard' }); PublicIpAllocationMethod = 'Static'; IpAddress = '20.1.1.1' } }
 function Get-AzLoadBalancer { param($ResourceGroupName, $Name) O @{ BackendAddressPools = @(O @{ Id = $poolId }); InboundNatRules = @() } }
-function Get-AzVirtualNetwork { param($ResourceGroupName, $Name) O @{ Name = $Name } }
+function Get-AzVirtualNetwork { param($ResourceGroupName, $Name) if ($global:CurSub -ne 's2') { throw 'ResourceNotFound: vnet is in another subscription' }; O @{ Name = $Name } }
 function Get-AzVirtualNetworkSubnetConfig { param($VirtualNetwork, $Name) O @{ AddressPrefix = @('10.0.1.0/24') } }
 function Test-AzPrivateIPAddressAvailability { param($ResourceGroupName, $VirtualNetworkName, $IPAddress)
+    if ($global:CurSub -ne 's2') { throw 'ResourceNotFound: vnet is in another subscription' }
     $taken = @($global:Az.nics.Values | % { $_.IpConfigurations } | % { $_.PrivateIpAddress })
     O @{ Available = ($IPAddress -notin $taken); AvailableIPAddresses = @('10.0.1.50') } }
 function Get-AzVMExtension { param($ResourceGroupName, $VMName)
@@ -163,6 +166,8 @@ Assert ((Get-PhaseStatus 2) -ne 'done') 'phase 2 refuses without ACKNOWLEDGE'
 Say 'y', '10.0.1.50', 'ACKNOWLEDGE', 'YES'   # keep placeholder, acknowledge complications, guest pre-checks
 Invoke-Phase2
 Assert ((Get-PhaseStatus 2) -eq 'done') 'phase 2 done'
+Assert ($global:Az.calls -contains 'ctx s2') 'phase 2 switched to the VNet subscription'
+Assert ($global:CurSub -eq 's1') 'context restored to the VM subscription'
 Assert ($script:State.placeholders['nic1|ipconfig1'] -eq '10.0.1.50') 'placeholder stored'
 
 Write-Host "`n===== PHASE 3 =====" -ForegroundColor Cyan

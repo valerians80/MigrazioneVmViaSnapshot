@@ -72,6 +72,32 @@ enable backup on the new VM once the old backup item is dealt with.
 - The replacement VM uses managed boot diagnostics.
 - Rollback deletes the new VM/NICs; it does not offer a "park the new NIC on a placeholder" variant.
 
+## Test environment (two subscriptions)
+
+`testenv/New-MigrationTestEnvironment.ps1` deploys a disposable environment through prompts (tenant, the two
+subscriptions, VM admin credentials):
+
+- subscription A: resource group with a VNet and one subnet (`10.250.1.0/24`)
+- subscription B: resource group with a Bv1 VM (default `Standard_B2ms`), static private IP, NSG, one data disk,
+  one extension. The NIC uses the subnet that lives in subscription A.
+
+```powershell
+pwsh .\testenv\New-MigrationTestEnvironment.ps1                  # Windows Server 2022 Gen2, B2ms
+pwsh .\testenv\New-MigrationTestEnvironment.ps1 -WithPublicIp -WithSystemIdentity -Zone 1
+pwsh .\testenv\New-MigrationTestEnvironment.ps1 -OsType Linux
+pwsh .\testenv\New-MigrationTestEnvironment.ps1 -Generation 1    # negative test: phase 1 must block it
+pwsh .\testenv\New-MigrationTestEnvironment.ps1 -VmSize Standard_F4s_v2   # Fsv2 -> Dlsv6 path
+pwsh .\testenv\New-MigrationTestEnvironment.ps1 -Destroy         # removes both resource groups
+```
+
+The script prints the exact command to run the migration against it and saves the deployment in `testenv.json`.
+Both resource groups are tagged `purpose=migration-test`; `-Destroy` only deletes groups carrying that tag.
+Run `-Destroy` when finished: a running B2ms VM costs a few cents per hour.
+
+Requirements for the cross-subscription NIC: both subscriptions in the same tenant, `Microsoft.Network` registered
+on both (the script registers it), and Network Contributor (or Contributor) on subscription A.
+The migration script switches subscription context by itself when a VNet, NSG or public IP lives elsewhere.
+
 ## Tests
 
 `tests/Invoke-VmSkuMigration.MockTest.ps1` runs phases 1-5 (including a rollback and a second migration) against an
