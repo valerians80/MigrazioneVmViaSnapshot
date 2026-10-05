@@ -1,29 +1,34 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    Interactive, tenant/subscription-agnostic migration of ONE Azure VM to a new size through a snapshot rebuild.
+    Interactive, tenant/subscription-agnostic rebuild of ONE Azure VM on a new size through snapshots.
 
 .DESCRIPTION
     Automates the Azure control-plane steps of the "SKU conversion and migration plan" playbook
     (Bv1 -> Bsv2, Fsv2 -> Dlsv6, or any other mapping you configure below).
 
-    The source VM is NEVER deleted during the migration. The replacement VM is created next to it with the
-    suffix "-mig" (VM, NICs, disks) and takes over the original private IP address. The source stays
-    deallocated, with its NIC parked on a placeholder IP, until sign-off. Rollback is therefore a reversal.
+    SCOPE: plain VM recreation only. The replacement VM is created next to the source with the suffix "-mig"
+    (VM, NICs, disks) and takes over the original private IP address. Everything the script does NOT handle
+    (managed identity, load balancer / application gateway pools, availability set, backup, locks, monitoring
+    rule associations, ...) is detected in phase 1, listed, and must be acknowledged before the migration starts.
+    Those items are handled by hand.
+
+    NOTHING of the source is ever deleted. The source VM, its NIC and its disks stay in place, deallocated, and
+    its NIC is parked on a placeholder IP. Rollback is therefore a reversal. Removing the old VM, disks and
+    snapshots, and re-enabling backup on the new VM, is a manual step after sign-off.
 
     The script does NOT touch the guest operating system. Temp-disk remediation, DHCP check, DNS, drive
     letters, services and application tests are owned by the team and are listed as a manual checklist.
 
     Phases (chosen from a menu, each one gated by the state of the previous ones):
-      1  Capture      Read-only. Writes config.json (frozen record of the source VM).
-      2  Network prep Read-only. Chooses and verifies placeholder IPs, checks target names are free.
-      3  Execute      Backup, deallocate, snapshots, new disks, IP swap, new NIC/VM, restore extras.
+      1  Capture      Read-only. Writes config.json and lists what the script cannot handle.
+      2  Network prep Read-only. Placeholder IPs, free target names, acknowledgements.
+      3  Execute      Deallocate source, snapshots, new disks, IP swap, new NIC/VM, extensions.
       4  Validate     Read-only. Compares the new VM with config.json, prints the manual checklist.
-      5  Rollback     Reverses phase 3, starts the source VM again.
-      6  Decommission Two passes: locks + delete source VM/NIC, then (after retention) disks + snapshots.
+      5  Rollback     Reverses phase 3 and starts the source VM again.
 
     Everything is kept per VM in <WorkRoot>\<vmName>\ : config.json, state.json, migration.log, reports.
-    Phase 3 and 6 write a checkpoint after every step and can be re-run to resume.
+    Phase 3 writes a checkpoint after every step and can be re-run to resume.
 
 .PARAMETER TenantId
     Optional. Prompted when omitted.
@@ -40,9 +45,8 @@
 
 .NOTES
     Required modules : Az.Accounts, Az.Compute, Az.Network, Az.Resources
-    Optional modules : Az.RecoveryServices (backup), Az.KeyVault (access policies of the system identity)
-    Required rights  : Contributor on the VM / network / disk resource groups, plus User Access Administrator
-                       (or Owner) on the scopes where the VM's managed identity holds role assignments.
+    Optional modules : Az.RecoveryServices (only used to detect whether the VM is backed up)
+    Required rights  : Contributor on the VM / network / disk resource groups.
 #>
 [CmdletBinding()]
 param(
@@ -74,9 +78,6 @@ $script:SkuMap = @{
     'Standard_F4s_v2' = 'Standard_D4ls_v6'
     'Standard_F8s_v2' = 'Standard_D8ls_v6'
 }
-
-$script:RetentionDaysDefault = 14
-$script:RetentionLockName    = 'mig-retention-lock'
 
 # Extension types that are re-created by the platform / backup service and must not be restored by hand.
 $script:ExtensionsToSkip = @('VMSnapshot', 'VMSnapshotLinux', 'RestorePoint*')
@@ -279,10 +280,8 @@ function Initialize-Workspace {
             placeholders   = @{}
             attestations   = @()
             created        = @{ snapshots = @(); disks = @(); nics = @(); vm = $null }
-            newPrincipalId = $null
             phase3Started  = $false
             warnings       = @()
-            decommission   = @{}
             history        = @()
         }
         Save-State
@@ -344,10 +343,8 @@ function Test-Prerequisites {
     foreach ($m in 'Az.Accounts', 'Az.Compute', 'Az.Network', 'Az.Resources') {
         if (-not (Get-Module -ListAvailable -Name $m)) { throw "Required module '$m' is not installed (Install-Module Az)." }
     }
-    foreach ($m in 'Az.RecoveryServices', 'Az.KeyVault') {
-        if (-not (Get-Module -ListAvailable -Name $m)) {
-            Write-Log "Optional module '$m' is not installed: the related steps will be reported for manual handling." 'WARN'
-        }
+    if (-not (Get-Module -ListAvailable -Name 'Az.RecoveryServices')) {
+        Write-Log "Optional module 'Az.RecoveryServices' is not installed: backup protection cannot be detected, check it manually." 'WARN'
     }
 }
 
@@ -447,6 +444,7 @@ function Test-TargetSku {
 }
 
 function Get-VmBackupInfo {
+    # Detection only: the script never enrols or removes backup protection.
     param([Parameter(Mandatory)][string]$Rg, [Parameter(Mandatory)][string]$Name)
     if (-not (Get-Command Get-AzRecoveryServicesBackupStatus -ErrorAction SilentlyContinue)) {
         return @{ moduleAvailable = $false; protected = $false }
@@ -454,16 +452,7 @@ function Get-VmBackupInfo {
     try {
         $st = Get-AzRecoveryServicesBackupStatus -Name $Name -ResourceGroupName $Rg -Type AzureVM
         if (-not $st.BackedUp) { return @{ moduleAvailable = $true; protected = $false } }
-        $vaultId = $st.VaultId
-        $container = Get-AzRecoveryServicesBackupContainer -ContainerType AzureVM -FriendlyName $Name -ResourceGroupName $Rg -VaultId $vaultId
-        $item = Get-AzRecoveryServicesBackupItem -Container $container -WorkloadType AzureVM -VaultId $vaultId
-        return @{
-            moduleAvailable = $true
-            protected       = $true
-            vaultId         = $vaultId
-            vaultName       = (Split-ResourceId $vaultId).Name
-            policyName      = [string]$item.ProtectionPolicyName
-        }
+        return @{ moduleAvailable = $true; protected = $true; vaultName = (Split-ResourceId $st.VaultId).Name }
     }
     catch {
         Write-Log "Backup status lookup failed: $($_.Exception.Message)" 'WARN'
@@ -484,30 +473,6 @@ function Get-DcrAssociations {
                 dceId = [string]$a.properties.dataCollectionEndpointId
             }
         })
-}
-
-function Get-KeyVaultGrants {
-    param([Parameter(Mandatory)][string]$PrincipalId)
-    $grants = @()
-    if (-not (Get-Command Get-AzKeyVault -ErrorAction SilentlyContinue)) { return $null }
-    foreach ($v in @(Get-AzKeyVault)) {
-        try {
-            $kv = Get-AzKeyVault -VaultName $v.VaultName -ResourceGroupName $v.ResourceGroupName
-            if ($kv.EnableRbacAuthorization) { continue }
-            foreach ($p in @($kv.AccessPolicies | Where-Object { $_.ObjectId -eq $PrincipalId })) {
-                $grants += @{
-                    vaultName    = $kv.VaultName
-                    resourceGroup = $kv.ResourceGroupName
-                    keys         = @($p.PermissionsToKeys)
-                    secrets      = @($p.PermissionsToSecrets)
-                    certificates = @($p.PermissionsToCertificates)
-                    storage      = @($p.PermissionsToStorage)
-                }
-            }
-        }
-        catch { Write-Log "Could not read access policies of vault '$($v.VaultName)': $($_.Exception.Message)" 'WARN' }
-    }
-    return $grants
 }
 
 # ======================================================================================================
@@ -548,8 +513,9 @@ function Invoke-Phase1 {
     $rg = $script:ResourceGroupName
     $vm = Get-AzVM -ResourceGroupName $rg -Name $script:VmName
     $location = $vm.Location
-    $blockers = @()
-    $warnings = @()
+    $blockers = @()        # the VM cannot be migrated by this script
+    $complications = @()   # the script does not handle these: listed and acknowledged, then done by hand
+    $warnings = @()        # informational
 
     # ---- compute ----
     $zones = @($vm.Zones | Where-Object { $_ })
@@ -560,7 +526,7 @@ function Invoke-Phase1 {
     if ($osd.DiffDiskSettings) { $blockers += 'Ephemeral OS disk: not supported (no snapshot possible).' }
     if ($vm.VirtualMachineScaleSet) { $blockers += 'VM belongs to a scale set: not supported.' }
     if ($vm.AdditionalCapabilities.UltraSSDEnabled) { $blockers += 'Ultra SSD enabled: not supported.' }
-    if ($vm.CapacityReservation.CapacityReservationGroup.Id) { $warnings += 'VM uses a capacity reservation group: the new VM will NOT join it.' }
+    if ($vm.CapacityReservation.CapacityReservationGroup.Id) { $complications += 'Capacity reservation group: the new VM will NOT join it.' }
     $secType = [string]$vm.SecurityProfile.SecurityType
     if ($secType -match 'Confidential') { $blockers += "Security type '$secType' is not supported." }
 
@@ -646,7 +612,7 @@ function Invoke-Phase1 {
         if ($e.ExtensionType -like 'AzureDiskEncryption*') { $blockers += "Azure Disk Encryption extension '$($e.Name)' present: handle this VM separately." }
         $skip = [bool]($script:ExtensionsToSkip | Where-Object { $e.ExtensionType -like $_ })
         $manual = [bool]($script:ExtensionsManual | Where-Object { $e.ExtensionType -like $_ })
-        if ($manual) { $warnings += "Extension '$($e.Name)' ($($e.ExtensionType)) has protected settings that cannot be read: re-apply it manually." }
+        if ($manual) { $complications += "Extension '$($e.Name)' ($($e.ExtensionType)) has protected settings that cannot be read: re-apply it manually." }
         $extRecords += [ordered]@{
             name                   = $e.Name
             publisher              = $e.Publisher
@@ -660,32 +626,22 @@ function Invoke-Phase1 {
         }
     }
 
-    # ---- identity ----
+    # ---- things the script does not handle (detected for the operator) ----
     $identityType = [string]$vm.Identity.Type
     $hasSystem = $identityType -match 'SystemAssigned'
     $hasUser = $identityType -match 'UserAssigned'
-    $principalId = [string]$vm.Identity.PrincipalId
-    $roleAssignments = @()
-    $kvGrants = @()
-    if ($hasSystem -and $principalId) {
-        try {
-            $roleAssignments = @(Get-AzRoleAssignment -ObjectId $principalId | ForEach-Object {
-                    [ordered]@{
-                        scope = $_.Scope; roleDefinitionId = $_.RoleDefinitionId; roleName = $_.RoleDefinitionName
-                        condition = [string]$_.Condition; conditionVersion = [string]$_.ConditionVersion
-                    }
-                })
-        }
-        catch { $warnings += "Could not read the role assignments of the system identity: $($_.Exception.Message). Record them manually." }
-        $kv = Get-KeyVaultGrants -PrincipalId $principalId
-        if ($null -eq $kv) { $warnings += 'Az.KeyVault not installed: check Key Vault access policies of the system identity manually.' }
-        else { $kvGrants = @($kv) }
-        $warnings += "System-assigned identity: the new VM gets a NEW principal ID. $($roleAssignments.Count) role assignment(s) and $($kvGrants.Count) Key Vault policy(ies) will be re-granted."
-    }
+    $userIds = @(if ($vm.Identity.UserAssignedIdentities) { $vm.Identity.UserAssignedIdentities.Keys })
+    if ($hasSystem) { $complications += 'System-assigned managed identity: the new VM gets a NEW principal ID. Re-enable the identity and re-grant every role assignment and Key Vault access policy.' }
+    if ($hasUser) { $complications += "User-assigned managed identity ($($userIds.Count)): not attached to the new VM. Attach: $($userIds -join ', ')" }
 
-    # ---- monitoring, locks, backup ----
+    $poolRefs = @($nicRecords | ForEach-Object { $_.ipConfigs } | ForEach-Object { @($_.lbPoolIds) + @($_.lbNatRuleIds) + @($_.appGwPoolIds) })
+    if ($poolRefs.Count) { $complications += "Load balancer / application gateway membership ($($poolRefs.Count) reference(s)): the new VM is NOT added. Add it to the same pools and rules." }
+    if ($vm.AvailabilitySetReference.Id) { $complications += "Availability set '$(Split-Path $vm.AvailabilitySetReference.Id -Leaf)': the new VM is created WITHOUT it (availability set membership cannot be changed afterwards)." }
+    if ($vm.ProximityPlacementGroup.Id) { $complications += "Proximity placement group '$(Split-Path $vm.ProximityPlacementGroup.Id -Leaf)': the new VM is created WITHOUT it." }
+
     $dcr = @()
     try { $dcr = @(Get-DcrAssociations -VmId $vm.Id) } catch { $warnings += "Could not read data collection rule associations: $($_.Exception.Message)" }
+    if ($dcr.Count) { $complications += "Data collection rule association(s) ($(($dcr | ForEach-Object { $_.name }) -join ', ')): re-create them on the new VM." }
 
     $vmLocks = @()
     try {
@@ -693,19 +649,21 @@ function Invoke-Phase1 {
             $lockScope = ($l.ResourceId -replace '/providers/Microsoft\.Authorization/locks/.*$', '')
             if ($lockScope -ieq $vm.Id) {
                 $vmLocks += [ordered]@{ name = $l.Name; level = [string]$l.Properties.level; notes = [string]$l.Properties.notes }
+                $complications += "Resource lock '$($l.Name)' ($($l.Properties.level)) on the VM: not copied to the new VM."
             }
             elseif ($lockScope -ieq "/subscriptions/$($script:SubscriptionId)/resourceGroups/$rg") {
                 $warnings += "Resource-group lock '$($l.Name)' ($($l.Properties.level)) exists and may block changes."
             }
             elseif ($lockScope -match '/(networkInterfaces|disks|snapshots)/') {
-                $warnings += "Lock '$($l.Name)' on $lockScope may block the migration or the clean-up."
+                $warnings += "Lock '$($l.Name)' on $lockScope may block the migration."
             }
         }
     }
     catch { $warnings += "Could not read resource locks: $($_.Exception.Message)" }
 
     $backup = Get-VmBackupInfo -Rg $rg -Name $vm.Name
-    if (-not $backup.moduleAvailable) { $warnings += 'Az.RecoveryServices not installed: check backup protection manually.' }
+    if ($backup.protected) { $complications += "Azure Backup (vault '$($backup.vaultName)'): the new VM is NOT protected. Enable backup by hand after validation, once the old VM and its backup item are dealt with." }
+    elseif (-not $backup.moduleAvailable) { $complications += 'Backup protection could not be checked (Az.RecoveryServices not installed): verify manually.' }
 
     # ---- write the record ----
     $bootDiag = $vm.DiagnosticsProfile.BootDiagnostics
@@ -720,8 +678,6 @@ function Invoke-Phase1 {
         vmId                      = $vm.Id
         location                  = $location
         zones                     = $zones
-        availabilitySetId         = [string]$vm.AvailabilitySetReference.Id
-        proximityPlacementGroupId = [string]$vm.ProximityPlacementGroup.Id
         sourceSku                 = $sourceSku
         targetSku                 = $targetSku
         skuFit                    = $fit
@@ -735,11 +691,7 @@ function Invoke-Phase1 {
         tags                      = (ConvertTo-PlainHashtable $vm.Tags)
         plan                      = if ($vm.Plan) { [ordered]@{ name = $vm.Plan.Name; publisher = $vm.Plan.Publisher; product = $vm.Plan.Product } } else { $null }
         bootDiagnostics           = [ordered]@{ enabled = [bool]$bootDiag.Enabled; storageUri = [string]$bootDiag.StorageUri }
-        identity                  = [ordered]@{
-            type = $identityType; hasSystem = $hasSystem; hasUser = $hasUser; principalId = $principalId
-            userAssignedIds = @(if ($vm.Identity.UserAssignedIdentities) { $vm.Identity.UserAssignedIdentities.Keys })
-            roleAssignments = $roleAssignments; keyVaultPolicies = $kvGrants
-        }
+        identity                  = [ordered]@{ type = $identityType; hasSystem = $hasSystem; hasUser = $hasUser; userAssignedIds = $userIds }
         osDisk                    = $osRecord
         dataDisks                 = $dataRecords
         nics                      = $nicRecords
@@ -747,6 +699,7 @@ function Invoke-Phase1 {
         dcrAssociations           = $dcr
         locks                     = $vmLocks
         backup                    = $backup
+        complications             = $complications
         warnings                  = $warnings
     }
     $cfg | ConvertTo-Json -Depth 20 | Set-Content -Path $script:Paths.Config -Encoding utf8
@@ -757,6 +710,11 @@ function Invoke-Phase1 {
     Write-Log "Disks: 1 OS + $($dataRecords.Count) data | NICs: $($nicRecords.Count) | Extensions: $($extRecords.Count) | AHB: '$($script:Config.licenseType)'"
     foreach ($n in $nicRecords) { foreach ($i in $n.ipConfigs) { Write-Log "  NIC $($n.name) / $($i.name): $($i.privateIp) ($($i.allocation))$(if ($i.publicIp) { ' + public ' + $i.publicIp.address })" } }
     foreach ($w in $warnings) { Write-Log $w 'WARN' }
+    if ($complications.Count) {
+        Write-Host ''
+        Write-Log "NOT HANDLED BY THIS SCRIPT ($($complications.Count)) - to be done by hand, you will be asked to acknowledge them in phase 2:" 'WARN'
+        foreach ($x in $complications) { Write-Log "  - $x" 'WARN' }
+    }
 
     if ($blockers.Count) {
         foreach ($b in $blockers) { Write-Log "BLOCKER: $b" 'ERROR' }
@@ -835,6 +793,14 @@ function Invoke-Phase2 {
         }
     }
 
+    if ($c.complications.Count) {
+        Write-Host ''
+        Write-Host 'The following are NOT handled by this script. The replacement VM will be created without them:' -ForegroundColor Yellow
+        foreach ($x in $c.complications) { Write-Host "  - $x" -ForegroundColor Yellow }
+        if (-not (Confirm-Typed 'Acknowledge that these will be handled by hand' 'ACKNOWLEDGE')) { Write-Log 'Complications not acknowledged: phase 2 not completed.' 'WARN'; return }
+        $script:State.attestations += @{ type = 'complications-acknowledged'; count = $c.complications.Count; by = $env:USERNAME; at = (Get-Date).ToString('o') }
+    }
+
     Write-Host ''
     Write-Host 'Guest pre-checks are owned by the team and are NOT verified by this script:'
     Write-Host '  - temp-disk remediation done (page file / swap, tempdb, fstab, app paths) and VM rebooted cleanly'
@@ -853,8 +819,8 @@ function Invoke-Phase2 {
 # ======================================================================================================
 
 function Set-SourceNicState {
-    # Rewrites the source NIC. Mode 'park' moves it to the placeholder IP and strips public IP / pools / NAT rules.
-    # Mode 'restore' puts the original configuration back.
+    # Rewrites the source NIC. Mode 'park' moves it to the placeholder IP and detaches the public IP.
+    # Mode 'restore' puts the original IP and public IP back. Pools, rules and NSG/ASG are never touched.
     param([Parameter(Mandatory)][ValidateSet('park', 'restore')][string]$Mode, [Parameter(Mandatory)]$NicRecord)
     $nic = Get-AzNetworkInterface -ResourceGroupName $NicRecord.resourceGroup -Name $NicRecord.name
     foreach ($ic in $nic.IpConfigurations) {
@@ -864,9 +830,6 @@ function Set-SourceNicState {
             $ic.PrivateIpAddress = $script:State.placeholders["$($NicRecord.name)|$($ic.Name)"]
             $ic.PrivateIpAllocationMethod = 'Static'
             $ic.PublicIpAddress = $null
-            $ic.LoadBalancerBackendAddressPools = $null
-            $ic.LoadBalancerInboundNatRules = $null
-            $ic.ApplicationGatewayBackendAddressPools = $null
         }
         else {
             $ic.PrivateIpAddress = $rec.privateIp
@@ -874,24 +837,6 @@ function Set-SourceNicState {
             if ($rec.publicIpId) {
                 $pp = Split-ResourceId $rec.publicIpId
                 $ic.PublicIpAddress = Get-AzPublicIpAddress -ResourceGroupName $pp.ResourceGroup -Name $pp.Name
-            }
-            if ($rec.lbPoolIds.Count) {
-                $ic.LoadBalancerBackendAddressPools = @(foreach ($id in $rec.lbPoolIds) {
-                        $r = Split-ResourceId $id
-                        (Get-AzLoadBalancer -ResourceGroupName $r.ResourceGroup -Name $r.Name).BackendAddressPools | Where-Object { $_.Id -ieq $id }
-                    })
-            }
-            if ($rec.lbNatRuleIds.Count) {
-                $ic.LoadBalancerInboundNatRules = @(foreach ($id in $rec.lbNatRuleIds) {
-                        $r = Split-ResourceId $id
-                        (Get-AzLoadBalancer -ResourceGroupName $r.ResourceGroup -Name $r.Name).InboundNatRules | Where-Object { $_.Id -ieq $id }
-                    })
-            }
-            if ($rec.appGwPoolIds.Count) {
-                $ic.ApplicationGatewayBackendAddressPools = @(foreach ($id in $rec.appGwPoolIds) {
-                        $r = Split-ResourceId $id
-                        (Get-AzApplicationGateway -ResourceGroupName $r.ResourceGroup -Name $r.Name).BackendAddressPools | Where-Object { $_.Id -ieq $id }
-                    })
             }
         }
     }
@@ -915,9 +860,6 @@ function New-ReplacementNic {
             if ($i.primary) { $p.Primary = $true }
             if ($i.publicIpId) { $p.PublicIpAddressId = $i.publicIpId }
             if ($i.asgIds.Count) { $p.ApplicationSecurityGroupId = @($i.asgIds) }
-            if ($i.lbPoolIds.Count) { $p.LoadBalancerBackendAddressPoolId = @($i.lbPoolIds) }
-            if ($i.lbNatRuleIds.Count) { $p.LoadBalancerInboundNatRuleId = @($i.lbNatRuleIds) }
-            if ($i.appGwPoolIds.Count) { $p.ApplicationGatewayBackendAddressPoolId = @($i.appGwPoolIds) }
             New-AzNetworkInterfaceIpConfig @p
         })
     $np = @{
@@ -951,16 +893,10 @@ function New-ReplacementVm {
     $newName = Get-TargetName $c.vmName -MaxLength 64
 
     $p = @{ VMName = $newName; VMSize = $c.targetSku }
-    if ($c.availabilitySetId) { $p.AvailabilitySetId = $c.availabilitySetId }
-    elseif ($c.zones.Count) { $p.Zone = @($c.zones) }
-    if ($c.proximityPlacementGroupId) { $p.ProximityPlacementGroupId = $c.proximityPlacementGroupId }
+    if ($c.zones.Count) { $p.Zone = @($c.zones) }
     if ($c.licenseType) { $p.LicenseType = $c.licenseType }
     if ($c.tags.Count) { $p.Tags = $c.tags }
     if ($c.encryptionAtHost) { $p.EncryptionAtHost = $true }
-    if ($c.identity.hasSystem -or $c.identity.hasUser) {
-        $p.IdentityType = if ($c.identity.hasSystem -and $c.identity.hasUser) { 'SystemAssignedUserAssigned' } elseif ($c.identity.hasSystem) { 'SystemAssigned' } else { 'UserAssigned' }
-        if ($c.identity.hasUser) { $p.IdentityId = @($c.identity.userAssignedIds) }
-    }
     $vmCfg = New-AzVMConfig @p
 
     if ($c.securityType -eq 'TrustedLaunch') {
@@ -997,7 +933,6 @@ function New-ReplacementVm {
 function Invoke-Phase3 {
     Write-Log 'PHASE 3 - Execute (modifies Azure resources)' 'STEP'
     foreach ($n in 1, 2) { if ((Get-PhaseStatus $n) -ne 'done') { Write-Log "Phase $n must be completed first." 'ERROR'; return } }
-    if ($script:State.decommission.pass1Done) { Write-Log 'Decommissioning has started: phase 3 can no longer run.' 'ERROR'; return }
     $c = $script:Config
     $st = $script:State
     $rg = $c.resourceGroup
@@ -1011,7 +946,8 @@ function Invoke-Phase3 {
     Write-Host "  Replacement VM : $newVmName  ($($c.targetSku))"
     Write-Host "  Disks          : 1 OS + $($c.dataDisks.Count) data (full snapshots, new managed disks)"
     Write-Host "  IP hand-over   : $(($c.nics | ForEach-Object { $_.ipConfigs } | ForEach-Object { $_.privateIp }) -join ', ')"
-    Write-Host '  Nothing on the source is deleted.'
+    Write-Host '  Nothing on the source is deleted: it stays deallocated, with its NIC parked on a placeholder IP.'
+    Write-Host '  Backup is not touched: the snapshots taken here are the rollback point.'
     if (-not (Confirm-Action 'Start (or resume) phase 3 now?')) { return }
     $st.phase3Started = $true
     Save-State
@@ -1022,18 +958,6 @@ function Invoke-Phase3 {
         if ($state -eq 'notfound') { throw "Source VM $($c.vmName) not found." }
         $taken = @(Test-TargetNamesFree)
         if ($taken.Count) { throw "Target names already in use: $($taken -join ', ')" }
-    }
-
-    # --- rollback point ---------------------------------------------------------------------------------
-    Invoke-Step 'p3.backup' {
-        $b = $c.backup
-        if (-not $b.protected) { Write-Log 'VM is not protected by Azure Backup (or backup module unavailable): relying on snapshots only.' 'WARN'; return }
-        if (-not (Confirm-Action "Run an on-demand backup in vault '$($b.vaultName)' before shutdown? (can take a long time)" -DefaultYes)) { Write-Log 'On-demand backup skipped by operator.' 'WARN'; return }
-        $container = Get-AzRecoveryServicesBackupContainer -ContainerType AzureVM -FriendlyName $c.vmName -ResourceGroupName $rg -VaultId $b.vaultId
-        $item = Get-AzRecoveryServicesBackupItem -Container $container -WorkloadType AzureVM -VaultId $b.vaultId
-        $job = Backup-AzRecoveryServicesBackupItem -Item $item -VaultId $b.vaultId -ExpiryDateTimeUTC (Get-Date).ToUniversalTime().AddDays(30)
-        $job = Wait-AzRecoveryServicesBackupJob -Job $job -VaultId $b.vaultId -Timeout 21600
-        if ($job.Status -ne 'Completed') { throw "On-demand backup ended with status $($job.Status)." }
     }
 
     # --- shutdown ---------------------------------------------------------------------------------------
@@ -1102,12 +1026,10 @@ function Invoke-Phase3 {
         New-ReplacementVm
         $nv = Get-AzVM -ResourceGroupName $rg -Name $newVmName
         $st.created.vm = $nv.Id
-        $st.newPrincipalId = [string]$nv.Identity.PrincipalId
         Write-Log "Replacement VM created: $($nv.Id)" 'OK'
     }
-    $newVm = Get-AzVM -ResourceGroupName $rg -Name $newVmName
 
-    # --- restore everything that does not survive a rebuild ---------------------------------------------
+    # --- extensions ---------------------------------------------------------------------------------------
     foreach ($e in $c.extensions) {
         if ($e.skip) { continue }
         if ($e.manual) { Write-Log "Extension '$($e.name)' needs manual re-application (protected settings)." 'WARN'; continue }
@@ -1124,68 +1046,15 @@ function Invoke-Phase3 {
         }
     }
 
-    foreach ($a in $c.dcrAssociations) {
-        Invoke-Step "p3.dcr.$($a.name)" -NonFatal {
-            $props = @{}
-            if ($a.dcrId) { $props.dataCollectionRuleId = $a.dcrId }
-            if ($a.dceId) { $props.dataCollectionEndpointId = $a.dceId }
-            $body = @{ properties = $props } | ConvertTo-Json -Depth 5
-            $r = Invoke-AzRestMethod -Method PUT -Path "$($newVm.Id)/providers/Microsoft.Insights/dataCollectionRuleAssociations/$($a.name)?api-version=2022-06-01" -Payload $body
-            if ($r.StatusCode -notin 200, 201) { throw "HTTP $($r.StatusCode): $($r.Content)" }
-        }
-    }
-
-    if ($c.identity.hasSystem) {
-        Invoke-Step 'p3.role-assignments' -NonFatal {
-            $failed = @()
-            foreach ($a in $c.identity.roleAssignments) {
-                $ok = $false
-                for ($try = 1; $try -le 5 -and -not $ok; $try++) {
-                    try {
-                        $ra = @{ ObjectId = $st.newPrincipalId; ObjectType = 'ServicePrincipal'; RoleDefinitionId = $a.roleDefinitionId; Scope = $a.scope }
-                        if ($a.condition) { $ra.Condition = $a.condition; $ra.ConditionVersion = $a.conditionVersion }
-                        New-AzRoleAssignment @ra | Out-Null
-                        $ok = $true
-                    }
-                    catch {
-                        if ($_.Exception.Message -match 'already exists|Conflict') { $ok = $true }
-                        elseif ($try -lt 5) { Start-Sleep -Seconds 15 }
-                        else { $failed += "$($a.roleName) @ $($a.scope): $($_.Exception.Message)" }
-                    }
-                }
-            }
-            if ($failed.Count) { throw "Role assignments not restored:`n  $($failed -join "`n  ")" }
-        }
-        Invoke-Step 'p3.keyvault-policies' -NonFatal {
-            foreach ($g in $c.identity.keyVaultPolicies) {
-                $kp = @{ VaultName = $g.vaultName; ResourceGroupName = $g.resourceGroup; ObjectId = $st.newPrincipalId }
-                if ($g.keys.Count) { $kp.PermissionsToKeys = @($g.keys) }
-                if ($g.secrets.Count) { $kp.PermissionsToSecrets = @($g.secrets) }
-                if ($g.certificates.Count) { $kp.PermissionsToCertificates = @($g.certificates) }
-                if ($g.storage.Count) { $kp.PermissionsToStorage = @($g.storage) }
-                Set-AzKeyVaultAccessPolicy @kp
-            }
-        }
-    }
-
-    Invoke-Step 'p3.locks' -NonFatal {
-        foreach ($l in $c.locks) {
-            New-AzResourceLock -LockName $l.name -LockLevel $l.level -LockNotes $l.notes -Scope $newVm.Id -Force | Out-Null
-        }
-    }
-
-    Invoke-Step 'p3.backup-enroll' -NonFatal {
-        $b = $c.backup
-        if (-not $b.protected) { return }
-        $pol = Get-AzRecoveryServicesBackupProtectionPolicy -Name $b.policyName -VaultId $b.vaultId
-        Enable-AzRecoveryServicesBackupProtection -Policy $pol -Name $newVmName -ResourceGroupName $rg -VaultId $b.vaultId | Out-Null
-    }
-
     $failed = @($st.warnings)
     Set-PhaseResult 3 $(if ($failed.Count) { 'done-with-warnings' } else { 'done' })
     Write-Host ''
     Write-Log "Phase 3 complete. Replacement VM $newVmName is running; source VM $($c.vmName) stays deallocated." 'OK'
-    foreach ($w in $failed) { Write-Log "Needs attention: $w (re-run phase 3 to retry failed restore steps)" 'WARN' }
+    foreach ($w in $failed) { Write-Log "Needs attention: $w (re-run phase 3 to retry failed extension steps)" 'WARN' }
+    if ($c.complications.Count) {
+        Write-Log 'Still to do by hand on the new VM:' 'WARN'
+        foreach ($x in $c.complications) { Write-Log "  - $x" 'WARN' }
+    }
     Write-Log 'Next: run phase 4 (validate) or phase 5 (rollback).'
 }
 
@@ -1222,7 +1091,6 @@ function Invoke-Phase4 {
     Add-EqCheck 'VM' 'Size' $c.targetSku $nv.HardwareProfile.VmSize
     Add-Check 'VM' 'Source VM not running (golden rule)' 'deallocated' $srcPower $(if ($srcPower -eq 'running') { 'FAIL' } else { 'PASS' })
     Add-EqCheck 'VM' 'Zone' ($c.zones -join ',') (@($nv.Zones) -join ',')
-    Add-EqCheck 'VM' 'Availability set' $c.availabilitySetId $nv.AvailabilitySetReference.Id
     Add-EqCheck 'VM' 'Security type' $c.securityType $nv.SecurityProfile.SecurityType
     Add-EqCheck 'VM' 'Hybrid Benefit (license type)' $c.licenseType $nv.LicenseType
     Add-EqCheck 'VM' 'Boot diagnostics enabled' $c.bootDiagnostics.enabled ([bool]$nv.DiagnosticsProfile.BootDiagnostics.Enabled)
@@ -1263,9 +1131,6 @@ function Invoke-Phase4 {
             Add-EqCheck 'NIC' "$nn/$($i.name) allocation" 'Static' $ni.PrivateIpAllocationMethod
             Add-EqCheck 'NIC' "$nn/$($i.name) public IP" $i.publicIpId $ni.PublicIpAddress.Id
             Add-EqCheck 'NIC' "$nn/$($i.name) ASGs" (($i.asgIds | Sort-Object) -join ',') ((@($ni.ApplicationSecurityGroups | ForEach-Object { $_.Id }) | Sort-Object) -join ',')
-            Add-EqCheck 'NIC' "$nn/$($i.name) LB pools" (($i.lbPoolIds | Sort-Object) -join ',') ((@($ni.LoadBalancerBackendAddressPools | ForEach-Object { $_.Id }) | Sort-Object) -join ',')
-            Add-EqCheck 'NIC' "$nn/$($i.name) LB NAT rules" (($i.lbNatRuleIds | Sort-Object) -join ',') ((@($ni.LoadBalancerInboundNatRules | ForEach-Object { $_.Id }) | Sort-Object) -join ',')
-            Add-EqCheck 'NIC' "$nn/$($i.name) AppGW pools" (($i.appGwPoolIds | Sort-Object) -join ',') ((@($ni.ApplicationGatewayBackendAddressPools | ForEach-Object { $_.Id }) | Sort-Object) -join ',')
         }
         $srcNic = Get-AzNetworkInterface -ResourceGroupName $n.resourceGroup -Name $n.name
         foreach ($i in $n.ipConfigs) {
@@ -1284,46 +1149,7 @@ function Invoke-Phase4 {
         if (-not $found) { Add-Check 'Extension' $e.name 'Succeeded' 'absent' 'FAIL' }
         else { Add-EqCheck 'Extension' $e.name 'Succeeded' $found.ProvisioningState }
     }
-    $newIdentityType = [string]$nv.Identity.Type
-    Add-EqCheck 'Identity' 'System-assigned present' $c.identity.hasSystem ($newIdentityType -match 'SystemAssigned')
-    Add-EqCheck 'Identity' 'User-assigned present' $c.identity.hasUser ($newIdentityType -match 'UserAssigned')
-    if ($c.identity.hasSystem) {
-        $newPid = [string]$nv.Identity.PrincipalId
-        try {
-            $have = @(Get-AzRoleAssignment -ObjectId $newPid | ForEach-Object { "$($_.RoleDefinitionId)@$($_.Scope)".ToLower() })
-            foreach ($a in $c.identity.roleAssignments) {
-                $key = "$($a.roleDefinitionId)@$($a.scope)".ToLower()
-                Add-Check 'Identity' "Role '$($a.roleName)' @ $($a.scope)" 'granted' $(if ($key -in $have) { 'granted' } else { 'missing' }) $(if ($key -in $have) { 'PASS' } else { 'FAIL' })
-            }
-        }
-        catch { Add-Check 'Identity' 'Role assignments' 'readable' $_.Exception.Message 'WARN' }
-        foreach ($g in $c.identity.keyVaultPolicies) {
-            try {
-                $kv = Get-AzKeyVault -VaultName $g.vaultName -ResourceGroupName $g.resourceGroup
-                $ok = [bool]($kv.AccessPolicies | Where-Object { $_.ObjectId -eq $newPid })
-                Add-Check 'Identity' "Key Vault policy $($g.vaultName)" 'present' $(if ($ok) { 'present' } else { 'missing' }) $(if ($ok) { 'PASS' } else { 'FAIL' })
-            }
-            catch { Add-Check 'Identity' "Key Vault policy $($g.vaultName)" 'readable' $_.Exception.Message 'WARN' }
-        }
-    }
-    $nvLocks = @(Get-AzResourceLock -Scope $nv.Id -ErrorAction SilentlyContinue | Where-Object { ($_.ResourceId -replace '/providers/Microsoft\.Authorization/locks/.*$', '') -ieq $nv.Id })
-    foreach ($l in $c.locks) {
-        $ok = [bool]($nvLocks | Where-Object { $_.Name -eq $l.name })
-        Add-Check 'Lock' $l.name 'present' $(if ($ok) { 'present' } else { 'missing' }) $(if ($ok) { 'PASS' } else { 'FAIL' })
-    }
-    if ($c.dcrAssociations.Count) {
-        $have = @(Get-DcrAssociations -VmId $nv.Id | ForEach-Object { $_.name })
-        foreach ($a in $c.dcrAssociations) {
-            $ok = $a.name -in $have
-            Add-Check 'Monitoring' "DCR association $($a.name)" 'present' $(if ($ok) { 'present' } else { 'missing' }) $(if ($ok) { 'PASS' } else { 'FAIL' })
-        }
-    }
-    if ($c.backup.protected) {
-        $nb = Get-VmBackupInfo -Rg $rg -Name $newName
-        Add-Check 'Backup' 'Protected' 'yes' $(if ($nb.protected) { 'yes' } else { 'no' }) $(if ($nb.protected) { 'PASS' } else { 'FAIL' })
-        if ($nb.protected) { Add-EqCheck 'Backup' 'Policy' $c.backup.policyName $nb.policyName }
-    }
-    else { Add-Check 'Backup' 'Source was not protected' 'n/a' 'n/a' 'INFO' }
+    foreach ($x in $c.complications) { Add-Check 'Manual follow-up' $x 'done by hand' 'not checked by script' 'INFO' }
 
     # boot diagnostics screenshot, for a human to look at
     try {
@@ -1367,7 +1193,8 @@ function Invoke-Phase4 {
     $approver = Read-Required 'Name of the person who confirmed the manual checks'
     $script:State.attestations += @{ type = 'manual-validation'; by = $approver; recordedBy = $env:USERNAME; at = (Get-Date).ToString('o') }
     Set-PhaseResult 4 'PASS'
-    Write-Log 'Phase 4 PASS. Release nothing until the owner has given formal sign-off, then run phase 6.' 'OK'
+    Write-Log 'Phase 4 PASS.' 'OK'
+    Write-Log "Nothing was deleted. After the owner's formal sign-off, by hand: remove the old VM, NIC, disks and snapshots (keep them for the agreed retention, 14 days by default), and enable backup on the new VM once the old backup item is dealt with." 'WARN'
 }
 
 # ======================================================================================================
@@ -1378,7 +1205,6 @@ function Invoke-Phase5 {
     Write-Log 'PHASE 5 - Rollback (modifies Azure resources)' 'STEP'
     $st = $script:State
     if (-not $st.phase3Started) { Write-Log 'Nothing to roll back: phase 3 never started.' 'WARN'; return }
-    if ($st.decommission.pass1Done) { Write-Log 'Decommissioning already started: the source VM no longer exists, rollback is not possible.' 'ERROR'; return }
     $c = $script:Config
     $rg = $c.resourceGroup
     $newName = Get-TargetName $c.vmName -MaxLength 64
@@ -1396,34 +1222,6 @@ function Invoke-Phase5 {
             Stop-AzVM -ResourceGroupName $rg -Name $newName -Force | Out-Null
         }
         if ((Get-VmPowerState -Rg $rg -Name $newName) -ne 'notfound') { Wait-VmPowerState -Rg $rg -Name $newName -State 'deallocated' }
-    }
-
-    Invoke-Step 'rb.cleanup-new-vm-links' -NonFatal {
-        $vmId = $st.created.vm
-        if (-not $vmId) { return }
-        if ((Get-VmPowerState -Rg $rg -Name $newName) -eq 'notfound') { return }
-        # locks that would block deletion
-        foreach ($l in @(Get-AzResourceLock -Scope $vmId -ErrorAction SilentlyContinue | Where-Object { ($_.ResourceId -replace '/providers/Microsoft\.Authorization/locks/.*$', '') -ieq $vmId })) {
-            Remove-AzResourceLock -LockId $l.LockId -Force | Out-Null
-        }
-        # DCR associations
-        foreach ($a in @(Get-DcrAssociations -VmId $vmId)) {
-            Invoke-AzRestMethod -Method DELETE -Path "$vmId/providers/Microsoft.Insights/dataCollectionRuleAssociations/$($a.name)?api-version=2022-06-01" | Out-Null
-        }
-        # backup protection of the new VM (data is retained)
-        if ($c.backup.protected -and (Get-Command Disable-AzRecoveryServicesBackupProtection -ErrorAction SilentlyContinue)) {
-            $b = $c.backup
-            $container = Get-AzRecoveryServicesBackupContainer -ContainerType AzureVM -FriendlyName $newName -ResourceGroupName $rg -VaultId $b.vaultId
-            if ($container) {
-                $item = Get-AzRecoveryServicesBackupItem -Container $container -WorkloadType AzureVM -VaultId $b.vaultId
-                Disable-AzRecoveryServicesBackupProtection -Item $item -VaultId $b.vaultId -Force | Out-Null
-            }
-        }
-        # grants of the new system identity
-        if ($st.newPrincipalId) {
-            foreach ($a in @(Get-AzRoleAssignment -ObjectId $st.newPrincipalId)) { Remove-AzRoleAssignment -ObjectId $st.newPrincipalId -RoleDefinitionId $a.RoleDefinitionId -Scope $a.Scope | Out-Null }
-            foreach ($g in $c.identity.keyVaultPolicies) { Remove-AzKeyVaultAccessPolicy -VaultName $g.vaultName -ResourceGroupName $g.resourceGroup -ObjectId $st.newPrincipalId }
-        }
     }
 
     Invoke-Step 'rb.delete-new-vm' {
@@ -1466,6 +1264,7 @@ function Invoke-Phase5 {
         'Confirm from inside the guest that the interface received the original address and DNS servers are correct'
         'Revert DNS records changed at cutover'
         'Revert firewall rules, allow-lists, application configuration, monitoring and backup targets changed at cutover'
+        'Undo anything already done by hand on the new VM (identity grants, load balancer pools, backup) if the new VM was touched'
         'Confirm with the application owner that service is restored'
     ) | ForEach-Object { Write-Host "  [ ] $_" }
 
@@ -1473,114 +1272,11 @@ function Invoke-Phase5 {
     $st.history += @{ event = 'rollback'; at = (Get-Date).ToString('o'); by = $env:USERNAME; reason = $reason }
     foreach ($k in @($st.steps.Keys | Where-Object { $_ -like 'p3.*' -or $_ -like 'rb.*' })) { $st.steps.Remove($k) }
     $st.created = @{ snapshots = @(); disks = @(); nics = @(); vm = $null }
-    $st.newPrincipalId = $null
     $st.phase3Started = $false
     $st.warnings = @()
     foreach ($k in '3', '4') { $st.phases.Remove($k) }
     Save-State
     Write-Log 'Rollback complete. Phases 3 and 4 were reset; the failure reason is in state.json history.' 'OK'
-}
-
-# ======================================================================================================
-# PHASE 6 - DECOMMISSION
-# ======================================================================================================
-
-function Invoke-Phase6 {
-    Write-Log 'PHASE 6 - Decommission (DESTRUCTIVE)' 'STEP'
-    $st = $script:State
-    $c = $script:Config
-    $rg = $c.resourceGroup
-    if ((Get-PhaseStatus 4) -ne 'PASS') { Write-Log 'Phase 4 must be PASS first.' 'ERROR'; return }
-    if ($st.decommission.completed) { Write-Log 'Decommissioning is already complete.' 'OK'; return }
-    $sourceDisks = @($c.osDisk) + @($c.dataDisks)
-    $snapNames = @{}
-    foreach ($d in $sourceDisks) { $snapNames[$d.name] = Get-TargetName $d.name -Middle '-snap' }
-
-    if (-not $st.decommission.pass1Done) {
-        # ---------------- pass 1: lock disks and snapshots, delete source VM and NIC ----------------
-        Write-Host ''
-        Write-Host "  This deletes the SOURCE VM object $($c.vmName) and its NIC(s). Disks and snapshots are locked and kept."
-        if (-not (Confirm-Typed 'Formal sign-off received from the application/business owner?' $c.vmName)) { Write-Log 'Cancelled.' 'WARN'; return }
-        $approver = Read-Required 'Sign-off given by (name)'
-        $reference = Read-Required 'Sign-off reference (ticket / mail / date)'
-        $days = [int](Read-Required 'Retention days for source disks and snapshots' ([string]$script:RetentionDaysDefault))
-        $st.attestations += @{ type = 'sign-off'; approver = $approver; reference = $reference; recordedBy = $env:USERNAME; at = (Get-Date).ToString('o') }
-        Save-State
-
-        Invoke-Step 'd1.lock-storage' {
-            foreach ($d in $sourceDisks) {
-                New-AzResourceLock -LockName $script:RetentionLockName -LockLevel CanNotDelete -ResourceName $d.name `
-                    -ResourceType 'Microsoft.Compute/disks' -ResourceGroupName $d.resourceGroup -LockNotes "Migration retention, sign-off $reference" -Force | Out-Null
-                if (Test-ResourceExists { Get-AzSnapshot -ResourceGroupName $d.resourceGroup -SnapshotName $snapNames[$d.name] -ErrorAction Stop }) {
-                    New-AzResourceLock -LockName $script:RetentionLockName -LockLevel CanNotDelete -ResourceName $snapNames[$d.name] `
-                        -ResourceType 'Microsoft.Compute/snapshots' -ResourceGroupName $d.resourceGroup -LockNotes "Migration retention, sign-off $reference" -Force | Out-Null
-                }
-            }
-        }
-        Invoke-Step 'd1.detach-options' {
-            # Safety: if any disk/NIC of the source had delete-with-VM, removing the VM would destroy it.
-            $vm = Get-AzVM -ResourceGroupName $rg -Name $c.vmName
-            $vm.StorageProfile.OsDisk.DeleteOption = 'Detach'
-            foreach ($dd in $vm.StorageProfile.DataDisks) { $dd.DeleteOption = 'Detach' }
-            foreach ($ni in $vm.NetworkProfile.NetworkInterfaces) { $ni.DeleteOption = 'Detach' }
-            Update-AzVM -ResourceGroupName $rg -VM $vm | Out-Null
-        }
-        Invoke-Step 'd1.source-vm-locks' {
-            foreach ($l in @(Get-AzResourceLock -Scope $c.vmId -ErrorAction SilentlyContinue | Where-Object { ($_.ResourceId -replace '/providers/Microsoft\.Authorization/locks/.*$', '') -ieq $c.vmId })) {
-                Remove-AzResourceLock -LockId $l.LockId -Force | Out-Null
-            }
-        }
-        Invoke-Step 'd1.delete-source-vm' {
-            if ((Get-VmPowerState -Rg $rg -Name $c.vmName) -ne 'notfound') {
-                if ((Get-VmPowerState -Rg $rg -Name $c.vmName) -ne 'deallocated') { throw 'Source VM is not deallocated.' }
-                Remove-AzVM -ResourceGroupName $rg -Name $c.vmName -Force | Out-Null
-            }
-        }
-        foreach ($n in $c.nics) {
-            Invoke-Step "d1.delete-source-nic.$($n.name)" {
-                if (Test-ResourceExists { Get-AzNetworkInterface -ResourceGroupName $n.resourceGroup -Name $n.name -ErrorAction Stop }) {
-                    Remove-AzNetworkInterface -ResourceGroupName $n.resourceGroup -Name $n.name -Force | Out-Null
-                }
-            }
-        }
-        $st.decommission.pass1Done = $true
-        $st.decommission.retentionUntil = (Get-Date).AddDays($days).ToString('o')
-        Save-State
-        Write-Log "Pass 1 complete. Source VM and NIC deleted, placeholder IPs released." 'OK'
-        Write-Log "Source disks and snapshots are locked until $((Get-Date).AddDays($days).ToString('yyyy-MM-dd')). Run phase 6 again after that date." 'OK'
-        Write-Log 'Reminder: keep the old backup vault item until its own retention expires; update the inventory record.' 'WARN'
-        return
-    }
-
-    # ---------------- pass 2: after retention, delete source disks then snapshots ----------------
-    $until = [datetime]$st.decommission.retentionUntil
-    if ((Get-Date) -lt $until) { Write-Log "Retention is still running until $($until.ToString('yyyy-MM-dd')). Nothing to do yet." 'WARN'; return }
-    Write-Host ''
-    Write-Host "  Retention expired. This PERMANENTLY deletes the source disks and snapshots of $($c.vmName)."
-    foreach ($d in $sourceDisks) { Write-Host "    disk $($d.name)  /  snapshot $($snapNames[$d.name])" }
-    if (-not (Confirm-Typed 'Delete source disks and snapshots?' $c.vmName)) { Write-Log 'Cancelled.' 'WARN'; return }
-
-    Invoke-Step 'd2.unlock' {
-        foreach ($d in $sourceDisks) {
-            Remove-AzResourceLock -LockName $script:RetentionLockName -ResourceName $d.name -ResourceType 'Microsoft.Compute/disks' -ResourceGroupName $d.resourceGroup -Force -ErrorAction SilentlyContinue | Out-Null
-            Remove-AzResourceLock -LockName $script:RetentionLockName -ResourceName $snapNames[$d.name] -ResourceType 'Microsoft.Compute/snapshots' -ResourceGroupName $d.resourceGroup -Force -ErrorAction SilentlyContinue | Out-Null
-        }
-    }
-    Invoke-Step 'd2.delete-disks' {
-        foreach ($d in $sourceDisks) {
-            if (Test-ResourceExists { Get-AzDisk -ResourceGroupName $d.resourceGroup -DiskName $d.name -ErrorAction Stop }) { Remove-AzDisk -ResourceGroupName $d.resourceGroup -DiskName $d.name -Force | Out-Null }
-        }
-    }
-    Invoke-Step 'd2.delete-snapshots' {
-        foreach ($d in $sourceDisks) {
-            $sn = $snapNames[$d.name]
-            if (Test-ResourceExists { Get-AzSnapshot -ResourceGroupName $d.resourceGroup -SnapshotName $sn -ErrorAction Stop }) { Remove-AzSnapshot -ResourceGroupName $d.resourceGroup -SnapshotName $sn -Force | Out-Null }
-        }
-    }
-    $st.decommission.completed = $true
-    Save-State
-    Set-PhaseResult 6 'done'
-    Write-Log 'Decommissioning complete. Update the inventory record with the new size and any changed configuration.' 'OK'
 }
 
 # ======================================================================================================
@@ -1594,11 +1290,10 @@ function Show-Status {
     Write-Host "VM $($script:VmName) | RG $rg | subscription $($script:SubscriptionId)" -ForegroundColor Cyan
     foreach ($row in @(
             @{ n = 1; t = 'Capture' }, @{ n = 2; t = 'Network prep' }, @{ n = 3; t = 'Execute' },
-            @{ n = 4; t = 'Validate' }, @{ n = 6; t = 'Decommission' })) {
+            @{ n = 4; t = 'Validate' })) {
         $s = Get-PhaseStatus $row.n
         Write-Host ('  Phase {0} {1,-13}: {2}' -f $row.n, $row.t, $(if ($s) { $s } else { '-' }))
     }
-    if ($st.decommission.pass1Done -and -not $st.decommission.completed) { Write-Host "  Retention until   : $(([datetime]$st.decommission.retentionUntil).ToString('yyyy-MM-dd'))" }
     if ($st.history.Count) { Write-Host "  Rollbacks so far  : $($st.history.Count)" }
     try {
         $src = Get-VmPowerState -Rg $rg -Name $script:VmName
@@ -1626,7 +1321,6 @@ function Start-Migration {
         '3' = @{ Label = 'Execute migration';            Run = { Invoke-Phase3 } }
         '4' = @{ Label = 'Validate';                     Run = { Invoke-Phase4 } }
         '5' = @{ Label = 'Rollback';                     Run = { Invoke-Phase5 } }
-        '6' = @{ Label = 'Decommission';                 Run = { Invoke-Phase6 } }
     }
     while ($true) {
         Show-Status

@@ -79,7 +79,7 @@ function Set-AzNetworkInterface { param([Parameter(ValueFromPipeline)]$NetworkIn
 function Remove-AzNetworkInterface { param($ResourceGroupName, $Name, [switch]$Force) Rec "remove-nic $Name"; $global:Az.nics.Remove($Name) }
 function New-AzNetworkInterfaceIpConfig { param($Name, $SubnetId, $PrivateIpAddress, [switch]$Primary, $PublicIpAddressId, $ApplicationSecurityGroupId, $LoadBalancerBackendAddressPoolId, $LoadBalancerInboundNatRuleId, $ApplicationGatewayBackendAddressPoolId)
     O @{ Name = $Name; Primary = [bool]$Primary; PrivateIpAddress = $PrivateIpAddress; PrivateIpAllocationMethod = 'Static'; PrivateIpAddressVersion = 'IPv4'; Subnet = (O @{ Id = $SubnetId })
-        PublicIpAddress = $(if ($PublicIpAddressId) { O @{ Id = $PublicIpAddressId } }); ApplicationSecurityGroups = @(); LoadBalancerBackendAddressPools = @($LoadBalancerBackendAddressPoolId | % { O @{ Id = $_ } }); LoadBalancerInboundNatRules = @(); ApplicationGatewayBackendAddressPools = @() } }
+        PublicIpAddress = $(if ($PublicIpAddressId) { O @{ Id = $PublicIpAddressId } }); ApplicationSecurityGroups = @(); LoadBalancerBackendAddressPools = @(if ($LoadBalancerBackendAddressPoolId) { $LoadBalancerBackendAddressPoolId | % { O @{ Id = $_ } } }); LoadBalancerInboundNatRules = @(); ApplicationGatewayBackendAddressPools = @() } }
 function New-AzNetworkInterface { param($Name, $ResourceGroupName, $Location, $IpConfiguration, $NetworkSecurityGroup, [switch]$EnableAcceleratedNetworking, [switch]$EnableIPForwarding, $DnsServer, $Tag, [switch]$Force)
     foreach ($n in $global:Az.nics.Values) { foreach ($i in $n.IpConfigurations) { if ($i.PrivateIpAddress -eq $IpConfiguration[0].PrivateIpAddress) { throw "PrivateIPAddressInUse: already in use" } } }
     Rec "new-nic $Name ip=$($IpConfiguration[0].PrivateIpAddress)"
@@ -150,12 +150,17 @@ Say 'Standard_B2s_v2'                    # target size (suggested is B2s_v2)
 Invoke-Phase1
 Assert ((Get-PhaseStatus 1) -eq 'done') 'phase 1 done'
 Assert ($script:Config.targetSku -eq 'Standard_B2s_v2' -and $script:Config.skuFit -eq 'Exact') 'target + fit recorded'
-Assert ($script:Config.identity.roleAssignments.Count -eq 1) 'role assignments captured'
-Assert ($script:Config.dcrAssociations.Count -eq 1) 'DCR association captured'
-Assert ($script:Config.nics[0].ipConfigs[0].lbPoolIds.Count -eq 1) 'LB pool captured'
+$cx = $script:Config.complications -join ' | '
+Assert ($cx -match 'System-assigned managed identity') 'complication: system identity flagged'
+Assert ($cx -match 'Load balancer') 'complication: load balancer flagged'
+Assert ($cx -match 'Data collection rule') 'complication: DCR flagged'
+Assert ($cx -match 'CustomScriptExtension') 'complication: protected-settings extension flagged'
 
 Write-Host "`n===== PHASE 2 =====" -ForegroundColor Cyan
-Say '10.0.1.10', '10.0.2.5', '10.0.1.50', 'YES'   # original (rejected), outside subnet (rejected), valid placeholder, attestation
+Say '10.0.1.10', '10.0.2.5', '10.0.1.50', 'nope'   # original (rejected), outside subnet (rejected), valid placeholder, wrong acknowledgement
+Invoke-Phase2
+Assert ((Get-PhaseStatus 2) -ne 'done') 'phase 2 refuses without ACKNOWLEDGE'
+Say 'y', '10.0.1.50', 'ACKNOWLEDGE', 'YES'   # keep placeholder, acknowledge complications, guest pre-checks
 Invoke-Phase2
 Assert ((Get-PhaseStatus 2) -eq 'done') 'phase 2 done'
 Assert ($script:State.placeholders['nic1|ipconfig1'] -eq '10.0.1.50') 'placeholder stored'
@@ -173,7 +178,11 @@ Assert ($global:Az.vms['vm1-mig'].HardwareProfile.VmSize -eq 'Standard_B2s_v2') 
 Assert ($global:Az.disks.ContainsKey('os1-mig') -and $global:Az.disks.ContainsKey('data1-mig')) 'new disks'
 Assert ($global:Az.snaps.ContainsKey('os1-snap-mig') -and $global:Az.snaps.ContainsKey('data1-snap-mig')) 'snapshots'
 Assert ($global:ExtAdded -contains 'AzureMonitorWindowsAgent' -and $global:ExtAdded -notcontains 'CustomScriptExtension') 'extensions: restored vs manual'
-Assert ($global:RoleAdded.Count -eq 1 -and $global:RoleAdded[0].ObjectId -eq 'pid-new') 'role re-granted to new principal'
+Assert ($global:RoleAdded.Count -eq 0) 'no role assignments touched'
+Assert (@($global:Az.calls | ? { $_ -like 'rest PUT' -or $_ -like 'rest DELETE' -or $_ -like 'lock*' -or $_ -like 'role*' }).Count -eq 0) 'no DCR write, lock or role calls'
+Assert ($global:Az.nics['nic1-mig'].IpConfigurations[0].LoadBalancerBackendAddressPools.Count -eq 0) 'new NIC not added to LB pool (flagged only)'
+Assert ($global:Az.nics['nic1'].IpConfigurations[0].LoadBalancerBackendAddressPools.Count -eq 1) 'source NIC pool membership untouched'
+Assert ($global:Az.calls -notcontains 'remove-vm vm1' -and -not (@($global:Az.calls | ? { $_ -like 'remove-*' }).Count)) 'nothing deleted in phase 3'
 Assert ((Get-PhaseStatus 3) -eq 'done') 'phase 3 status'
 Assert ($global:Az.calls.IndexOf('stop vm1') -lt $global:Az.calls.IndexOf('new-vm vm1-mig')) 'order: stop before create'
 Assert (@($global:Az.calls | ? { $_ -like 'start vm1' }).Count -eq 0) 'source never started in phase 3'
@@ -203,24 +212,13 @@ Assert ($global:Az.vms['vm1'].Power -eq 'running') 'source running again'
 Assert (-not $global:Az.disks.ContainsKey('os1-mig') -and -not $global:Az.snaps.ContainsKey('os1-snap-mig')) 'new storage deleted'
 Assert ((Get-PhaseStatus 3) -eq '' -and -not $script:State.phase3Started) 'phase 3 reset'
 
-Write-Host "`n===== PHASE 3+4 again, then PHASE 6 =====" -ForegroundColor Cyan
+Write-Host "`n===== PHASE 3+4 again =====" -ForegroundColor Cyan
 Say 'y'; Invoke-Phase3
 Say 'y', 'Alice'; Invoke-Phase4
 Assert ((Get-PhaseStatus 4) -eq 'PASS') 'second migration validated'
-Say 'vm1', 'Bob', 'CHG0001', '14'
-Invoke-Phase6
-Assert (-not $global:Az.vms.ContainsKey('vm1')) 'source VM deleted'
-Assert (-not $global:Az.nics.ContainsKey('nic1')) 'source NIC deleted'
-Assert ($global:Az.disks.ContainsKey('os1') -and $global:Az.disks.ContainsKey('data1')) 'source disks kept'
-Assert ($global:Az.snaps.ContainsKey('os1-snap-mig')) 'snapshots kept'
-Invoke-Phase6   # retention not expired -> nothing
-Assert ($global:Az.disks.ContainsKey('os1')) 'retention respected'
-$script:State.decommission.retentionUntil = (Get-Date).AddDays(-1).ToString('o'); Save-State
-Say 'vm1'
-Invoke-Phase6
-Assert (-not $global:Az.disks.ContainsKey('os1') -and -not $global:Az.snaps.ContainsKey('os1-snap-mig')) 'pass 2 deleted source disks and snapshots'
-Assert ($global:Az.disks.ContainsKey('os1-mig') -and $global:Az.vms.ContainsKey('vm1-mig')) 'replacement untouched'
-Assert ($script:State.decommission.completed) 'decommission complete'
+Assert ($global:Az.vms.ContainsKey('vm1') -and $global:Az.vms['vm1'].Power -eq 'deallocated') 'old VM kept, deallocated'
+Assert ($global:Az.nics.ContainsKey('nic1') -and $global:Az.disks.ContainsKey('os1') -and $global:Az.disks.ContainsKey('data1')) 'old NIC and disks kept'
+Assert ($global:Az.snaps.ContainsKey('os1-snap-mig') -and $global:Az.snaps.ContainsKey('data1-snap-mig')) 'snapshots kept'
 
 Write-Host "`nALL MOCK TESTS PASSED" -ForegroundColor Green
 Remove-Item $work -Recurse -Force
