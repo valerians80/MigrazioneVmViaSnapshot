@@ -1422,7 +1422,7 @@ function Get-NewVmLines {
     $lines += "Size           : $($C.targetSku) ($($C.skuFit))"
     $lines += "Security type  : $(if ($C.securityType) { $C.securityType } else { 'Standard (none)' }) (same)"
     $pips = @($C.nics | ForEach-Object { $_.ipConfigs } | Where-Object { $_.publicIp } | ForEach-Object { "$($_.publicIp.address) ($($_.publicIp.name))" })
-    $lines += "Public IP      : $(if ($pips) { ($pips -join ', ') + ' - from the old VM' } else { 'none' })"
+    $lines += "Public IP      : $(if ($pips) { $pips -join ', ' } else { 'none' })"
     $lines += "NICs           : $($C.nics.Count)"
     foreach ($n in $C.nics) {
         foreach ($i in $n.ipConfigs) { $lines += "  $(Get-TargetName $n.name): $($i.privateIp) (static, original IP)" }

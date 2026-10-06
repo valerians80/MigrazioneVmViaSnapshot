@@ -1,5 +1,7 @@
 # Azure VM size migration via snapshot
 
+> **Guida d'uso con le schermate** (italiano): [`docs/guida-utilizzo.html`](docs/guida-utilizzo.html) - aprila nel browser.
+
 `Invoke-VmSkuMigration.ps1` automates the Azure control-plane steps of the *SKU conversion and migration plan*
 playbook (Bv1 -> Bsv2, Fsv2 -> Dlsv6, or any mapping you set). One VM per run, everything asked at prompts,
 no tenant/subscription/customer values in the code.
