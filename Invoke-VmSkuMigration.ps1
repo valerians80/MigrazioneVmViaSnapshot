@@ -1,41 +1,46 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    Interactive, tenant/subscription-agnostic rebuild of ONE Azure VM on a new size through snapshots.
+    Guided, tenant/subscription-agnostic rebuild of ONE Azure VM on a new size through snapshots.
 
 .DESCRIPTION
     Automates the Azure control-plane steps of the "SKU conversion and migration plan" playbook
     (Bv1 -> Bsv2, Fsv2 -> Dlsv6, or any other mapping you configure below).
 
+    The script is a single guided flow:
+      1. clears the screen and explains what it does
+      2. Connect-AzAccount, subscription (from a list), VM name
+      3. reminds the manual checks (guest OS) and asks for a Y/N confirmation
+      4. reads the VM and shows two columns: CURRENT VM (green, left) and NEW VM (red, right), redrawn after
+         every step, with the power state of both machines
+      5. asks for the new size (the playbook list, checked against the subscription: region, zone, quota)
+      6. takes the first free IP of the subnet as placeholder for the old NIC(s); the new NIC(s) get the original IP
+      7. shows the full plan and what is NOT handled, asks to acknowledge it, then Y/N to deploy
+      8. deploys: shut down the old VM, snapshots, new disks, IP hand-over, new NIC/VM, extensions
+      9. runs automatic checks and reminds the tests to do, keeping the old VM switched off
+
+    Running the script again on a VM that already has a migration offers: resume, run the checks again, or roll back.
+
     SCOPE: plain VM recreation only. The replacement VM is created next to the source with the suffix "-mig"
-    (VM, NICs, disks) and takes over the original private IP address. Everything the script does NOT handle
-    (managed identity, load balancer / application gateway pools, availability set, backup, locks, monitoring
-    rule associations, ...) is detected in phase 1, listed, and must be acknowledged before the migration starts.
-    Those items are handled by hand.
+    (VM, NICs, disks). Everything the script does NOT handle (managed identity, load balancer / application gateway
+    pools, availability set, backup, locks, monitoring rule associations, ...) is detected, listed and must be
+    acknowledged before the start; those items are done by hand.
 
-    NOTHING of the source is ever deleted. The source VM, its NIC and its disks stay in place, deallocated, and
-    its NIC is parked on a placeholder IP. Rollback is therefore a reversal. Removing the old VM, disks and
-    snapshots, and re-enabling backup on the new VM, is a manual step after sign-off.
+    NOTHING of the source is ever deleted. The source VM, its NIC and its disks stay in place, deallocated, and its
+    NIC is parked on a placeholder IP. Rollback is a reversal. Removing the old VM, disks and snapshots, and
+    enabling backup on the new VM, are manual steps after sign-off.
 
-    The script does NOT touch the guest operating system. Temp-disk remediation, DHCP check, DNS, drive
-    letters, services and application tests are owned by the team and are listed as a manual checklist.
-
-    Phases (chosen from a menu, each one gated by the state of the previous ones):
-      1  Capture      Read-only. Writes config.json and lists what the script cannot handle.
-      2  Network prep Read-only. Placeholder IPs, free target names, acknowledgements.
-      3  Execute      Deallocate source, snapshots, new disks, IP swap, new NIC/VM, extensions.
-      4  Validate     Read-only. Compares the new VM with config.json, prints the manual checklist.
-      5  Rollback     Reverses phase 3 and starts the source VM again.
+    The script does NOT touch the guest operating system.
 
     Everything is kept per VM in <WorkRoot>\<vmName>\ : config.json, state.json, migration.log, reports.
-    Phase 3 writes a checkpoint after every step and can be re-run to resume.
+    The deployment writes a checkpoint after every step and can be resumed.
 
 .PARAMETER TenantId
-    Optional. Prompted when omitted.
+    Optional. Signs in to this tenant. Prompted by Connect-AzAccount when omitted.
 .PARAMETER SubscriptionId
-    Optional. Prompted (with a list) when omitted.
+    Optional. Skips the subscription list.
 .PARAMETER ResourceGroupName
-    Optional. Prompted when omitted.
+    Optional. Skips the VM lookup (use together with -VmName).
 .PARAMETER VmName
     Optional. Prompted when omitted.
 .PARAMETER WorkRoot
@@ -47,6 +52,7 @@
     Required modules : Az.Accounts, Az.Compute, Az.Network, Az.Resources
     Optional modules : Az.RecoveryServices (only used to detect whether the VM is backed up)
     Required rights  : Contributor on the VM / network / disk resource groups.
+    Window width     : two columns need about 110 characters; narrower windows stack the two blocks.
 #>
 [CmdletBinding()]
 param(
@@ -98,6 +104,15 @@ $script:SkuCache = @{}
 $script:Suffix   = $Suffix
 $script:Checks   = $null
 
+# screen / UI state
+$script:UiActive      = $false   # when $true, Write-Log only writes to the log file (the wizard draws the screen)
+$script:ClearScreen   = $true
+$script:Notices       = [System.Collections.Generic.List[string]]::new()
+$script:PowerCache    = $null
+$script:CurrentStep   = $null
+$script:OnStepChanged = $null
+$script:LastBlockers  = @()
+
 # ======================================================================================================
 # LOGGING AND PROMPTS
 # ======================================================================================================
@@ -109,8 +124,19 @@ function Write-Log {
     )
     $color = switch ($Level) { 'WARN' { 'Yellow' } 'ERROR' { 'Red' } 'OK' { 'Green' } 'STEP' { 'Cyan' } default { 'Gray' } }
     $line = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
-    Write-Host $line -ForegroundColor $color
     if ($script:Paths -and $script:Paths.Log) { Add-Content -Path $script:Paths.Log -Value $line }
+    if ($Level -in 'WARN', 'ERROR') {
+        $script:Notices.Add($Message)
+        while ($script:Notices.Count -gt 5) { $script:Notices.RemoveAt(0) }
+    }
+    if (-not $script:UiActive) { Write-Host $line -ForegroundColor $color }
+}
+
+function Write-Busy {
+    # Always visible one-line progress message for long operations (also logged).
+    param([Parameter(Mandatory)][string]$Message)
+    Write-Host "  ... $Message" -ForegroundColor DarkGray
+    if ($script:Paths -and $script:Paths.Log) { Add-Content -Path $script:Paths.Log -Value ('{0} [INFO] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message) }
 }
 
 function Read-Required {
@@ -327,12 +353,17 @@ function Invoke-Step {
         return
     }
     Write-Log "Step: $Name" 'STEP'
+    $script:CurrentStep = $Name
+    if ($script:OnStepChanged) { & $script:OnStepChanged $Name $false }
     try {
         & $Action
         $script:State.steps[$Name] = (Get-Date).ToString('o')
         Save-State
+        $script:CurrentStep = $null
+        if ($script:OnStepChanged) { & $script:OnStepChanged $Name $true }
     }
     catch {
+        $script:CurrentStep = $null
         $msg = "Step '$Name' failed: $($_.Exception.Message)"
         Add-Content -Path $script:Paths.Log -Value $_.ScriptStackTrace
         if ($NonFatal) {
@@ -361,36 +392,58 @@ function Test-Prerequisites {
 }
 
 function Connect-Target {
-    if (-not $script:TenantId) { $script:TenantId = Read-Required 'Tenant ID (GUID or domain name)' }
-
     $ctx = Get-AzContext -ErrorAction SilentlyContinue
     $reuse = $false
-    if ($ctx -and $ctx.Tenant -and ($ctx.Tenant.Id -eq $script:TenantId)) {
-        $reuse = Confirm-Action "Already signed in as '$($ctx.Account.Id)' on this tenant. Reuse the session?" -DefaultYes
+    if ($ctx -and $ctx.Account -and (-not $script:TenantId -or $ctx.Tenant.Id -eq $script:TenantId)) {
+        $reuse = Confirm-Action "Already signed in as '$($ctx.Account.Id)'. Use this session?" -DefaultYes
     }
-    if (-not $reuse) { Connect-AzAccount -Tenant $script:TenantId | Out-Null }
+    if (-not $reuse) {
+        Write-Host 'Signing in with Connect-AzAccount ...' -ForegroundColor Cyan
+        if ($script:TenantId) { Connect-AzAccount -Tenant $script:TenantId | Out-Null } else { Connect-AzAccount | Out-Null }
+    }
 
-    $subs = @(Get-AzSubscription -TenantId $script:TenantId | Where-Object { $_.State -eq 'Enabled' })
-    if (-not $subs) { throw 'No enabled subscription visible in this tenant.' }
+    Write-Busy 'Reading the subscriptions you can access...'
+    $subs = @(Get-AzSubscription | Where-Object { $_.State -eq 'Enabled' } | Sort-Object Name)
+    if (-not $subs) { throw 'No enabled subscription visible with this account.' }
 
-    if (-not $script:SubscriptionId) {
+    $sub = $null
+    if ($script:SubscriptionId) { $sub = $subs | Where-Object { $_.Id -eq $script:SubscriptionId } | Select-Object -First 1 }
+    if (-not $sub) {
+        Write-Host ''
+        Write-Host 'Subscription where the VM lives:' -ForegroundColor Cyan
         for ($i = 0; $i -lt $subs.Count; $i++) { Write-Host ('  [{0}] {1}  ({2})' -f ($i + 1), $subs[$i].Name, $subs[$i].Id) }
-        $pick = Read-Required 'Subscription number, name or ID'
-        $sub = if ($pick -match '^\d+$' -and [int]$pick -ge 1 -and [int]$pick -le $subs.Count) { $subs[[int]$pick - 1] }
-        else { $subs | Where-Object { $_.Id -eq $pick -or $_.Name -eq $pick } | Select-Object -First 1 }
-        if (-not $sub) { throw "Subscription '$pick' not found." }
-        $script:SubscriptionId = $sub.Id
+        while (-not $sub) {
+            $pick = Read-Required 'Subscription number'
+            if ($pick -match '^\d+$' -and [int]$pick -ge 1 -and [int]$pick -le $subs.Count) { $sub = $subs[[int]$pick - 1] }
+        }
     }
+    $ctx = Set-AzContext -SubscriptionId $sub.Id -Tenant $sub.TenantId
+    $script:SubscriptionId = $sub.Id
+    $script:TenantId = $sub.TenantId
+    Write-Log "Context: $($ctx.Account.Id) | tenant $($sub.TenantId) | subscription $($sub.Name) ($($sub.Id))" 'OK'
+}
 
-    $ctx = Set-AzContext -SubscriptionId $script:SubscriptionId -Tenant $script:TenantId
-    Write-Log "Context: $($ctx.Account.Id) | tenant $($ctx.Tenant.Id) | subscription $($ctx.Subscription.Name) ($($ctx.Subscription.Id))" 'OK'
-    if (-not (Confirm-Action 'Work on THIS subscription?' -DefaultYes)) { throw 'Cancelled by operator.' }
+function Select-Vm {
+    if ($script:ResourceGroupName -and $script:VmName) { $null = Get-AzVM -ResourceGroupName $script:ResourceGroupName -Name $script:VmName; return }
+    while ($true) {
+        if (-not $script:VmName) { $script:VmName = Read-Required 'Name of the VM to migrate' }
+        Write-Busy 'Looking for the VM in the subscription...'
+        $found = @(Get-AzVM | Where-Object { $_.Name -ieq $script:VmName -and (-not $script:ResourceGroupName -or $_.ResourceGroupName -ieq $script:ResourceGroupName) })
+        if ($found.Count -eq 1) { $script:ResourceGroupName = $found[0].ResourceGroupName; $script:VmName = $found[0].Name; return }
+        if ($found.Count -eq 0) { Write-Host "VM '$($script:VmName)' not found in this subscription." -ForegroundColor Yellow; $script:VmName = $null; continue }
+        Write-Host "More than one VM is called '$($script:VmName)':" -ForegroundColor Yellow
+        for ($i = 0; $i -lt $found.Count; $i++) { Write-Host ('  [{0}] resource group {1} ({2})' -f ($i + 1), $found[$i].ResourceGroupName, $found[$i].Location) }
+        while ($true) {
+            $pick = Read-Required 'Number'
+            if ($pick -match '^\d+$' -and [int]$pick -ge 1 -and [int]$pick -le $found.Count) { $script:ResourceGroupName = $found[[int]$pick - 1].ResourceGroupName; return }
+        }
+    }
 }
 
 function Get-VmSkuInfo {
     param([Parameter(Mandatory)][string]$Location, [Parameter(Mandatory)][string]$SkuName)
     if (-not $script:SkuCache.ContainsKey($Location)) {
-        Write-Log "Loading the compute SKU catalogue for '$Location' (can take a minute)..."
+        Write-Busy "Loading the compute SKU catalogue for '$Location' (can take a minute)..."
         $script:SkuCache[$Location] = @(Get-AzComputeResourceSku -Location $Location | Where-Object { $_.ResourceType -eq 'virtualMachines' })
     }
     $s = $script:SkuCache[$Location] | Where-Object { $_.Name -eq $SkuName } | Select-Object -First 1
@@ -517,10 +570,10 @@ function Get-DiskRecord {
     }
 }
 
-function Invoke-Phase1 {
-    Write-Log 'PHASE 1 - Capture the source configuration (read-only)' 'STEP'
-    if ($script:State.phase3Started) { Write-Log 'Phase 3 already started: the configuration record is frozen.' 'ERROR'; return }
-    if ((Test-Path $script:Paths.Config) -and -not (Confirm-Action 'config.json already exists. Capture again and overwrite it?')) { return }
+function Invoke-Capture {
+    # Read-only. Writes config.json. Returns $true when the VM can be migrated, $false when there are blockers.
+    Write-Log 'Capture the source configuration (read-only)' 'STEP'
+    if ($script:State.phase3Started) { throw 'The migration already started: the configuration record is frozen.' }
 
     $rg = $script:ResourceGroupName
     $vm = Get-AzVM -ResourceGroupName $rg -Name $script:VmName
@@ -556,20 +609,11 @@ function Invoke-Phase1 {
     }
     $generation = if ($osRecord.hyperVGeneration) { $osRecord.hyperVGeneration } else { 'V1' }
 
-    # ---- target size ----
+    # ---- source size (the target is chosen later) ----
     $sourceInfo = Get-VmSkuInfo -Location $location -SkuName $sourceSku
-    $suggested = $script:SkuMap[$sourceSku]
-    if ($suggested) { Write-Log "Mapping table proposes $sourceSku -> $suggested" }
-    else { Write-Log "No mapping for ${sourceSku}: enter the target size manually." 'WARN' }
-    $targetSku = Read-Required 'Target size' $suggested
-    $targetInfo = Get-VmSkuInfo -Location $location -SkuName $targetSku
-    $skuProblems = @(Test-TargetSku -Location $location -Zone $zone -Generation $generation -Source $sourceInfo -Target $targetInfo)
-    $blockers += $skuProblems
-    $fit = 'Unknown'
-    if ($sourceInfo -and $targetInfo) {
-        $fit = if ($targetInfo.VCpus -eq $sourceInfo.VCpus -and $targetInfo.MemoryGB -eq $sourceInfo.MemoryGB) { 'Exact' } else { 'Upsize' }
-        Write-Log ("Fit: {0} ({1} vCPU / {2} GiB -> {3} vCPU / {4} GiB)" -f $fit, $sourceInfo.VCpus, $sourceInfo.MemoryGB, $targetInfo.VCpus, $targetInfo.MemoryGB)
-    }
+    if (-not $sourceInfo) { $blockers += "Source size $sourceSku not found in the SKU catalogue of $location." }
+    $targetSku = ''
+    $fit = ''
 
     # ---- network ----
     $nicRecords = @()
@@ -717,30 +761,34 @@ function Invoke-Phase1 {
     $cfg | ConvertTo-Json -Depth 20 | Set-Content -Path $script:Paths.Config -Encoding utf8
     Import-Config
 
-    Write-Host ''
-    Write-Log "VM $($vm.Name) | $location | zone '$zone' | $sourceSku -> $targetSku | Gen $generation | $($script:Config.osType)"
-    Write-Log "Disks: 1 OS + $($dataRecords.Count) data | NICs: $($nicRecords.Count) | Extensions: $($extRecords.Count) | AHB: '$($script:Config.licenseType)'"
-    foreach ($n in $nicRecords) { foreach ($i in $n.ipConfigs) { Write-Log "  NIC $($n.name) / $($i.name): $($i.privateIp) ($($i.allocation))$(if ($i.publicIp) { ' + public ' + $i.publicIp.address })" } }
+    $script:LastBlockers = @($blockers)
     foreach ($w in $warnings) { Write-Log $w 'WARN' }
-    if ($complications.Count) {
-        Write-Host ''
-        Write-Log "NOT HANDLED BY THIS SCRIPT ($($complications.Count)) - to be done by hand, you will be asked to acknowledge them in phase 2:" 'WARN'
-        foreach ($x in $complications) { Write-Log "  - $x" 'WARN' }
-    }
-
     if ($blockers.Count) {
         foreach ($b in $blockers) { Write-Log "BLOCKER: $b" 'ERROR' }
         Set-PhaseResult 1 'blocked'
-        Write-Log "config.json written but the VM cannot be migrated as is. Fix the blockers and capture again." 'ERROR'
-        return
+        return $false
     }
     Set-PhaseResult 1 'done'
-    Write-Log "Phase 1 complete. Record saved to $($script:Paths.Config)" 'OK'
+    Write-Log "Capture complete. Record saved to $($script:Paths.Config)" 'OK'
+    return $true
 }
 
 # ======================================================================================================
 # PHASE 2 - NETWORK PREPARATION
 # ======================================================================================================
+
+function Get-SnapshotName {
+    # The LUN is part of the name so that a manual intervention knows which snapshot belongs to which disk.
+    param([Parameter(Mandatory)]$Disk, [Parameter(Mandatory)][bool]$IsOs)
+    if ($IsOs) { return (Get-TargetName $Disk.name -Middle '-snap-os') }
+    return (Get-TargetName $Disk.name -Middle "-snap-lun$($Disk.lun)")
+}
+
+function Get-SnapshotNameCandidates {
+    # Current name plus the name used by earlier versions of the script (so rollback and the free-name check see both).
+    param([Parameter(Mandatory)]$Disk, [Parameter(Mandatory)][bool]$IsOs)
+    return @((Get-SnapshotName -Disk $Disk -IsOs $IsOs), (Get-TargetName $Disk.name -Middle '-snap')) | Select-Object -Unique
+}
 
 function Test-TargetNamesFree {
     $c = $script:Config
@@ -753,36 +801,71 @@ function Test-TargetNamesFree {
         if (Test-ResourceExists { Get-AzNetworkInterface -ResourceGroupName $n.resourceGroup -Name $nn -ErrorAction Stop }) { $taken += "NIC $nn" }
     }
     foreach ($d in @($c.osDisk) + @($c.dataDisks)) {
+        $isOs = ($d.name -eq $c.osDisk.name)
         $dn = Get-TargetName $d.name
-        $sn = Get-TargetName $d.name -Middle '-snap'
         if (Test-ResourceExists { Get-AzDisk -ResourceGroupName $d.resourceGroup -DiskName $dn -ErrorAction Stop }) { $taken += "disk $dn" }
-        if (Test-ResourceExists { Get-AzSnapshot -ResourceGroupName $d.resourceGroup -SnapshotName $sn -ErrorAction Stop }) { $taken += "snapshot $sn" }
+        foreach ($sn in (Get-SnapshotNameCandidates -Disk $d -IsOs $isOs)) {
+            if (Test-ResourceExists { Get-AzSnapshot -ResourceGroupName $d.resourceGroup -SnapshotName $sn -ErrorAction Stop }) { $taken += "snapshot $sn" }
+        }
     }
     return $taken
 }
 
-function Invoke-Phase2 {
-    Write-Log 'PHASE 2 - Network preparation (read-only)' 'STEP'
-    if ((Get-PhaseStatus 1) -ne 'done') { Write-Log 'Phase 1 must be completed first.' 'ERROR'; return }
-    if ($script:State.phase3Started) { Write-Log 'Phase 3 already started: placeholders are frozen.' 'ERROR'; return }
+function Select-TargetSku {
+    # Lists the target sizes of the playbook, checks them against the subscription and lets the operator choose.
     $c = $script:Config
-
-    $taken = @(Test-TargetNamesFree)
-    if ($taken.Count) {
-        foreach ($t in $taken) { Write-Log "Name already in use: $t" 'ERROR' }
-        Write-Log 'Remove or rename these resources, then run phase 2 again.' 'ERROR'
-        return
+    Write-Busy 'Checking the target sizes against the subscription (region, zone, quota)...'
+    $sourceInfo = Get-VmSkuInfo -Location $c.location -SkuName $c.sourceSku
+    $zone = if ($c.zones.Count) { [string]$c.zones[0] } else { '' }
+    $suggested = $script:SkuMap[$c.sourceSku]
+    $rows = @()
+    $ordered = @($script:SkuMap.Values | Select-Object -Unique | Sort-Object { $_ -replace '^Standard_([A-Za-z]+)\d+.*$', '$1' }, { [int]($_ -replace '^Standard_[A-Za-z]+(\d+).*$', '$1') }, { $_ })
+    foreach ($name in $ordered) {
+        $info = Get-VmSkuInfo -Location $c.location -SkuName $name
+        $problems = @(Test-TargetSku -Location $c.location -Zone $zone -Generation $c.hyperVGeneration -Source $sourceInfo -Target $info)
+        $fit = if ($info -and $sourceInfo) { if ($info.VCpus -eq $sourceInfo.VCpus -and $info.MemoryGB -eq $sourceInfo.MemoryGB) { 'Exact' } elseif ($info.VCpus -ge $sourceInfo.VCpus -and $info.MemoryGB -ge $sourceInfo.MemoryGB) { 'Upsize' } else { 'Smaller' } } else { '-' }
+        $rows += [pscustomobject]@{ Name = $name; Info = $info; Fit = $fit; Problems = $problems; Ok = ($problems.Count -eq 0) }
     }
-    Write-Log "Target names are free (suffix '$script:Suffix')." 'OK'
 
+    Show-Screen -Title 'CHOOSE THE NEW SIZE'
+    Write-Host ''
+    Write-Host "Current size: $($c.sourceSku)   ($($sourceInfo.VCpus) vCPU / $($sourceInfo.MemoryGB) GiB, Hyper-V $($c.hyperVGeneration), zone '$zone')" -ForegroundColor Cyan
+    Write-Host 'Target sizes from the playbook:' -ForegroundColor Cyan
+    for ($i = 0; $i -lt $rows.Count; $i++) {
+        $r = $rows[$i]
+        $spec = if ($r.Info) { '{0,2} vCPU {1,5} GiB' -f $r.Info.VCpus, $r.Info.MemoryGB } else { '' }
+        $mark = if ($r.Name -eq $suggested) { ' (proposed by the mapping)' } else { '' }
+        if ($r.Ok) { Write-Host ('  [{0}] {1,-20} {2}  {3,-7} available{4}' -f ($i + 1), $r.Name, $spec, $r.Fit, $mark) -ForegroundColor Green }
+        else { Write-Host ('  [{0}] {1,-20} {2}  {3,-7} NOT USABLE: {4}' -f ($i + 1), $r.Name, $spec, $r.Fit, $r.Problems[0]) -ForegroundColor DarkGray }
+    }
+    $usable = @($rows | Where-Object { $_.Ok })
+    if (-not $usable) { throw 'None of the target sizes can be used for this VM in this subscription (see the list above).' }
+
+    $default = $rows | Where-Object { $_.Name -eq $suggested -and $_.Ok } | Select-Object -First 1
+    $chosen = $null
+    while (-not $chosen) {
+        $prompt = if ($default) { 'New size number (Enter = proposed)' } else { 'New size number' }
+        $pick = (Read-Host $prompt).Trim()
+        if ($pick -eq '' -and $default) { $chosen = $default }
+        elseif ($pick -match '^\d+$' -and [int]$pick -ge 1 -and [int]$pick -le $rows.Count -and $rows[[int]$pick - 1].Ok) { $chosen = $rows[[int]$pick - 1] }
+        else { Write-Host 'Choose one of the available sizes.' -ForegroundColor Yellow }
+    }
+    $c.targetSku = $chosen.Name
+    $c.skuFit = $chosen.Fit
+    $c | ConvertTo-Json -Depth 20 | Set-Content -Path $script:Paths.Config -Encoding utf8
+    Write-Log "Target size chosen: $($chosen.Name) ($($chosen.Fit))" 'OK'
+}
+
+function Set-PlaceholderIps {
+    # For every IP configuration of the old VM, takes the first free address of its subnet. The old NIC is parked
+    # on it, so the new NIC can take over the original address. Stops when no address is free.
+    $c = $script:Config
+    Write-Busy 'Looking for free placeholder addresses in the subnet(s)...'
     $placeholders = @{}
     $used = @()
     foreach ($n in $c.nics) {
         foreach ($i in $n.ipConfigs) {
             $key = "$($n.name)|$($i.name)"
-            $existing = $script:State.placeholders[$key]
-            if ($existing -and (Confirm-Action "Keep placeholder $existing for $key?" -DefaultYes)) { $placeholders[$key] = $existing; $used += $existing; continue }
-
             $sn = Split-ResourceId $i.subnetId
             $subnetName = ($sn.Rest -split '/')[1]
             $prefixes = @(Invoke-InSubscription $sn.Subscription {
@@ -790,42 +873,20 @@ function Invoke-Phase2 {
                     (Get-AzVirtualNetworkSubnetConfig -VirtualNetwork $vnet -Name $subnetName).AddressPrefix
                 })
             $probe = Invoke-InSubscription $sn.Subscription { Test-AzPrivateIPAddressAvailability -ResourceGroupName $sn.ResourceGroup -VirtualNetworkName $sn.Name -IPAddress $i.privateIp }
-            if ($probe.AvailableIPAddresses) { Write-Log "Free addresses suggested by Azure: $($probe.AvailableIPAddresses -join ', ')" }
-
-            while ($true) {
-                $ip = Read-Required "Placeholder IP for $key (subnet $subnetName, $($prefixes -join ', '); current $($i.privateIp))"
-                $parsed = $null
-                if (-not [ipaddress]::TryParse($ip, [ref]$parsed)) { Write-Log 'Not a valid IP address.' 'WARN'; continue }
-                if ($ip -eq $i.privateIp -or $ip -in $used) { Write-Log 'Must differ from the original IP and from the other placeholders.' 'WARN'; continue }
-                if (-not ($prefixes | Where-Object { Test-IpInCidr -Ip $ip -Cidr $_ })) { Write-Log 'Address is outside the subnet.' 'WARN'; continue }
-                $res = Invoke-InSubscription $sn.Subscription { Test-AzPrivateIPAddressAvailability -ResourceGroupName $sn.ResourceGroup -VirtualNetworkName $sn.Name -IPAddress $ip }
-                if (-not $res.Available) { Write-Log "Address is not available. Suggested: $($res.AvailableIPAddresses -join ', ')" 'WARN'; continue }
-                break
+            $pick = $null
+            foreach ($candidate in @($probe.AvailableIPAddresses)) {
+                if ($candidate -in $used -or $candidate -eq $i.privateIp) { continue }
+                if (-not ($prefixes | Where-Object { Test-IpInCidr -Ip $candidate -Cidr $_ })) { continue }
+                $check = Invoke-InSubscription $sn.Subscription { Test-AzPrivateIPAddressAvailability -ResourceGroupName $sn.ResourceGroup -VirtualNetworkName $sn.Name -IPAddress $candidate }
+                if ($check.Available) { $pick = $candidate; break }
             }
-            $placeholders[$key] = $ip
-            $used += $ip
+            if (-not $pick) { throw "No free IP address available in subnet '$subnetName' ($($prefixes -join ', ')) for $key. Free an address and run the script again." }
+            $placeholders[$key] = $pick
+            $used += $pick
         }
     }
-
-    if ($c.complications.Count) {
-        Write-Host ''
-        Write-Host 'The following are NOT handled by this script. The replacement VM will be created without them:' -ForegroundColor Yellow
-        foreach ($x in $c.complications) { Write-Host "  - $x" -ForegroundColor Yellow }
-        if (-not (Confirm-Typed 'Acknowledge that these will be handled by hand' 'ACKNOWLEDGE')) { Write-Log 'Complications not acknowledged: phase 2 not completed.' 'WARN'; return }
-        $script:State.attestations += @{ type = 'complications-acknowledged'; count = $c.complications.Count; by = $env:USERNAME; at = (Get-Date).ToString('o') }
-    }
-
-    Write-Host ''
-    Write-Host 'Guest pre-checks are owned by the team and are NOT verified by this script:'
-    Write-Host '  - temp-disk remediation done (page file / swap, tempdb, fstab, app paths) and VM rebooted cleanly'
-    Write-Host '  - guest network interface is on DHCP (no static IPv4 inside the OS)'
-    Write-Host '  - owners informed, change window agreed, DNS/firewall dependencies listed for rollback'
-    if (-not (Confirm-Typed 'Confirm the guest pre-checks are complete' 'YES')) { Write-Log 'Pre-checks not confirmed: phase 2 not completed.' 'WARN'; return }
-
     $script:State.placeholders = $placeholders
-    $script:State.attestations += @{ type = 'guest-prechecks'; by = $env:USERNAME; at = (Get-Date).ToString('o') }
     Set-PhaseResult 2 'done'
-    Write-Log 'Phase 2 complete.' 'OK'
 }
 
 # ======================================================================================================
@@ -944,9 +1005,10 @@ function New-ReplacementVm {
     }
 }
 
-function Invoke-Phase3 {
-    Write-Log 'PHASE 3 - Execute (modifies Azure resources)' 'STEP'
-    foreach ($n in 1, 2) { if ((Get-PhaseStatus $n) -ne 'done') { Write-Log "Phase $n must be completed first." 'ERROR'; return } }
+function Invoke-Execute {
+    # Modifies Azure resources. Checkpointed: running it again resumes from the last completed step.
+    foreach ($n in 1, 2) { if ((Get-PhaseStatus $n) -ne 'done') { throw "Step $n (capture / placeholders) must be completed first." } }
+    if (-not $script:Config.targetSku) { throw 'No target size chosen.' }
     $c = $script:Config
     $st = $script:State
     $rg = $c.resourceGroup
@@ -954,15 +1016,6 @@ function Invoke-Phase3 {
     if (-not $st.created.ContainsKey('diskIds')) { $st.created.diskIds = @{} }
     if (-not $st.created.ContainsKey('nicIds')) { $st.created.nicIds = @{} }
     if (-not $st.created.ContainsKey('snapshotIds')) { $st.created.snapshotIds = @{} }
-
-    Write-Host ''
-    Write-Host "  Source VM      : $($c.vmName)  ($($c.sourceSku))  -> will be SHUT DOWN and deallocated"
-    Write-Host "  Replacement VM : $newVmName  ($($c.targetSku))"
-    Write-Host "  Disks          : 1 OS + $($c.dataDisks.Count) data (full snapshots, new managed disks)"
-    Write-Host "  IP hand-over   : $(($c.nics | ForEach-Object { $_.ipConfigs } | ForEach-Object { $_.privateIp }) -join ', ')"
-    Write-Host '  Nothing on the source is deleted: it stays deallocated, with its NIC parked on a placeholder IP.'
-    Write-Host '  Backup is not touched: the snapshots taken here are the rollback point.'
-    if (-not (Confirm-Action 'Start (or resume) phase 3 now?')) { return }
     $st.phase3Started = $true
     Save-State
 
@@ -989,7 +1042,7 @@ function Invoke-Phase3 {
     foreach ($d in @($c.osDisk) + @($c.dataDisks)) {
         $isOs = ($d.name -eq $c.osDisk.name)
         Invoke-Step "p3.snapshot.$($d.name)" {
-            $snapName = Get-TargetName $d.name -Middle '-snap'
+            $snapName = Get-SnapshotName -Disk $d -IsOs $isOs
             $src = Get-AzDisk -ResourceGroupName $d.resourceGroup -DiskName $d.name
             $sp = @{ SourceUri = $src.Id; Location = $c.location; CreateOption = 'Copy'; SkuName = 'Standard_LRS' }
             if ($d.tags.Count) { $sp.Tag = $d.tags }
@@ -1065,14 +1118,10 @@ function Invoke-Phase3 {
 
     $failed = @($st.warnings)
     Set-PhaseResult 3 $(if ($failed.Count) { 'done-with-warnings' } else { 'done' })
-    Write-Host ''
-    Write-Log "Phase 3 complete. Replacement VM $newVmName is running; source VM $($c.vmName) stays deallocated." 'OK'
+    Write-Log "Deployment complete. Replacement VM $newVmName is running; source VM $($c.vmName) stays deallocated." 'OK'
     foreach ($w in $failed) { Write-Log "Needs attention: $w (re-run phase 3 to retry failed extension steps)" 'WARN' }
     if ($c.complications.Count) {
-        Write-Log 'Still to do by hand on the new VM:' 'WARN'
-        foreach ($x in $c.complications) { Write-Log "  - $x" 'WARN' }
     }
-    Write-Log 'Next: run phase 4 (validate) or phase 5 (rollback).'
 }
 
 # ======================================================================================================
@@ -1090,9 +1139,10 @@ function Add-EqCheck {
     Add-Check $Area $Check $Expected $Actual $result
 }
 
-function Invoke-Phase4 {
-    Write-Log 'PHASE 4 - Validate (read-only)' 'STEP'
-    if ((Get-PhaseStatus 3) -notin 'done', 'done-with-warnings') { Write-Log 'Phase 3 must be completed first.' 'ERROR'; return }
+function Invoke-Validate {
+    # Read-only. Compares the new VM with config.json. Returns the list of checks.
+    Write-Log 'Validate (read-only)' 'STEP'
+    if ((Get-PhaseStatus 3) -notin 'done', 'done-with-warnings') { throw 'The deployment must be completed first.' }
     $c = $script:Config
     $rg = $c.resourceGroup
     $newName = Get-TargetName $c.vmName -MaxLength 64
@@ -1181,45 +1231,21 @@ function Invoke-Phase4 {
 
     # ---- report ----
     $script:Checks | Export-Csv -Path $script:Paths.Report -NoTypeInformation -Encoding utf8
-    $script:Checks | Format-Table Area, Check, Expected, Actual, Result -AutoSize -Wrap | Out-String -Width 220 | Write-Host
     $fail = @($script:Checks | Where-Object { $_.Result -eq 'FAIL' }).Count
-    $warn = @($script:Checks | Where-Object { $_.Result -eq 'WARN' }).Count
-    Write-Log "Platform checks: $($script:Checks.Count) total, $fail FAIL, $warn WARN. Report: $($script:Paths.Report)" $(if ($fail) { 'ERROR' } else { 'OK' })
-
-    Write-Host ''
-    Write-Host 'MANUAL CHECKLIST (guest and application, owned by the team):' -ForegroundColor Cyan
-    @(
-        'Guest interface is on DHCP and received the expected address (check inside the OS, not only the portal)'
-        'DNS servers correct; forward and reverse resolution working; no stale cached entries on clients'
-        'Drive letters / mount points match the pre-migration record (D: may have been reassigned)'
-        'Page file or swap on its new location, not on a temporary disk'
-        'No automatic-start service stopped, no failed systemd unit, no new errors in the system event log'
-        'Domain-joined Windows: AD trust relationship intact'
-        'SQL Server: service running and tempdb up from its relocated path'
-        'Application owner confirms a representative transaction, database connectivity and scheduled jobs'
-        'Inbound/outbound connectivity and reachability from dependent systems on the expected ports'
-    ) | ForEach-Object { Write-Host "  [ ] $_" }
-    Write-Host ''
-
-    if ($fail) { Set-PhaseResult 4 'FAIL'; Write-Log 'Validation FAILED on platform checks. Fix them (re-run phase 3 for restore steps) or roll back (phase 5).' 'ERROR'; return }
-    if (-not (Confirm-Action 'Have the manual guest/application checks been completed by the team and passed?')) {
-        Set-PhaseResult 4 'FAIL'
-        Write-Log 'Manual checks not passed. Phase 4 recorded as FAIL.' 'WARN'
-        return
-    }
-    $approver = Read-Required 'Name of the person who confirmed the manual checks'
-    $script:State.attestations += @{ type = 'manual-validation'; by = $approver; recordedBy = $env:USERNAME; at = (Get-Date).ToString('o') }
-    Set-PhaseResult 4 'PASS'
-    Write-Log 'Phase 4 PASS.' 'OK'
-    Write-Log "Nothing was deleted. After the owner's formal sign-off, by hand: remove the old VM, NIC, disks and snapshots (keep them for the agreed retention, 14 days by default), and enable backup on the new VM once the old backup item is dealt with." 'WARN'
+    Write-Log "Platform checks: $($script:Checks.Count) total, $fail FAIL. Report: $($script:Paths.Report)" $(if ($fail) { 'ERROR' } else { 'OK' })
+    Set-PhaseResult 4 $(if ($fail) { 'FAIL' } else { 'PASS' })
+    return $script:Checks
 }
 
 # ======================================================================================================
 # PHASE 5 - ROLLBACK
 # ======================================================================================================
 
-function Invoke-Phase5 {
-    Write-Log 'PHASE 5 - Rollback (modifies Azure resources)' 'STEP'
+function Invoke-Rollback {
+    # Modifies Azure resources: deletes the NEW VM and NICs, restores the old NIC and starts the old VM.
+    $script:UiActive = $false
+    $script:OnStepChanged = $null
+    Write-Log 'Rollback (modifies Azure resources)' 'STEP'
     $st = $script:State
     if (-not $st.phase3Started) { Write-Log 'Nothing to roll back: phase 3 never started.' 'WARN'; return }
     $c = $script:Config
@@ -1268,9 +1294,12 @@ function Invoke-Phase5 {
     if (Confirm-Action 'Also delete the new disks and snapshots created by phase 3 (needed to retry the migration with the same names)?') {
         Invoke-Step 'rb.delete-new-storage' -NonFatal {
             foreach ($d in @($c.osDisk) + @($c.dataDisks)) {
-                $dn = Get-TargetName $d.name; $sn = Get-TargetName $d.name -Middle '-snap'
+                $dn = Get-TargetName $d.name
+                $isOs = ($d.name -eq $c.osDisk.name)
                 if (Test-ResourceExists { Get-AzDisk -ResourceGroupName $d.resourceGroup -DiskName $dn -ErrorAction Stop }) { Remove-AzDisk -ResourceGroupName $d.resourceGroup -DiskName $dn -Force | Out-Null }
-                if (Test-ResourceExists { Get-AzSnapshot -ResourceGroupName $d.resourceGroup -SnapshotName $sn -ErrorAction Stop }) { Remove-AzSnapshot -ResourceGroupName $d.resourceGroup -SnapshotName $sn -Force | Out-Null }
+                foreach ($sn in (Get-SnapshotNameCandidates -Disk $d -IsOs $isOs)) {
+                    if (Test-ResourceExists { Get-AzSnapshot -ResourceGroupName $d.resourceGroup -SnapshotName $sn -ErrorAction Stop }) { Remove-AzSnapshot -ResourceGroupName $d.resourceGroup -SnapshotName $sn -Force | Out-Null }
+                }
             }
         }
     }
@@ -1297,64 +1326,365 @@ function Invoke-Phase5 {
 }
 
 # ======================================================================================================
-# MENU
+# SCREEN: current VM (green, left) and new VM (red, right)
 # ======================================================================================================
 
-function Show-Status {
-    $st = $script:State
-    $rg = $script:ResourceGroupName
-    Write-Host ''
-    Write-Host "VM $($script:VmName) | RG $rg | subscription $($script:SubscriptionId)" -ForegroundColor Cyan
-    foreach ($row in @(
-            @{ n = 1; t = 'Capture' }, @{ n = 2; t = 'Network prep' }, @{ n = 3; t = 'Execute' },
-            @{ n = 4; t = 'Validate' })) {
-        $s = Get-PhaseStatus $row.n
-        Write-Host ('  Phase {0} {1,-13}: {2}' -f $row.n, $row.t, $(if ($s) { $s } else { '-' }))
+function Clear-Screen { if ($script:ClearScreen) { Clear-Host } }
+
+function Get-ScreenWidth {
+    $w = 0
+    try { $w = [int]$Host.UI.RawUI.WindowSize.Width } catch { $w = 0 }
+    if ($w -lt 40) { $w = 120 }
+    return $w
+}
+
+function Format-Cell {
+    param([string]$Text, [int]$Width)
+    if ($null -eq $Text) { $Text = '' }
+    if ($Text.Length -gt $Width) { return ($Text.Substring(0, [Math]::Max(0, $Width - 3)) + '...') }
+    return $Text.PadRight($Width)
+}
+
+function Write-Columns {
+    param([string[]]$Left, [string[]]$Right, [string]$LeftTitle, [string]$RightTitle)
+    $width = Get-ScreenWidth
+    if ($width -lt 110) {
+        # narrow window: stack the two blocks
+        Write-Host $LeftTitle -ForegroundColor Green
+        foreach ($l in $Left) { Write-Host "  $l" -ForegroundColor Green }
+        Write-Host ''
+        Write-Host $RightTitle -ForegroundColor Red
+        foreach ($r in $Right) { Write-Host "  $r" -ForegroundColor Red }
+        return
     }
-    if ($st.history.Count) { Write-Host "  Rollbacks so far  : $($st.history.Count)" }
-    try {
-        $src = Get-VmPowerState -Rg $rg -Name $script:VmName
-        $new = Get-VmPowerState -Rg $rg -Name (Get-TargetName $script:VmName -MaxLength 64)
-        Write-Host "  Source VM         : $src"
-        Write-Host "  Replacement VM    : $new"
+    $col = [int][Math]::Floor(($width - 4) / 2)
+    Write-Host (Format-Cell $LeftTitle $col) -NoNewline -ForegroundColor Green
+    Write-Host ' | ' -NoNewline -ForegroundColor DarkGray
+    Write-Host (Format-Cell $RightTitle $col) -ForegroundColor Red
+    Write-Host (('-' * $col) + '-+-' + ('-' * $col)) -ForegroundColor DarkGray
+    $rows = [Math]::Max($Left.Count, $Right.Count)
+    for ($i = 0; $i -lt $rows; $i++) {
+        $l = if ($i -lt $Left.Count) { $Left[$i] } else { '' }
+        $r = if ($i -lt $Right.Count) { $Right[$i] } else { '' }
+        Write-Host (Format-Cell $l $col) -NoNewline -ForegroundColor Green
+        Write-Host ' | ' -NoNewline -ForegroundColor DarkGray
+        Write-Host (Format-Cell $r $col) -ForegroundColor Red
     }
-    catch { Write-Host "  (power state unavailable: $($_.Exception.Message))" }
+}
+
+function Update-PowerCache {
+    $c = $script:Config
+    $src = 'unknown'; $new = 'unknown'
+    try { $src = Get-VmPowerState -Rg $c.resourceGroup -Name $c.vmName } catch { }
+    try { $new = Get-VmPowerState -Rg $c.resourceGroup -Name (Get-TargetName $c.vmName -MaxLength 64) } catch { }
+    $script:PowerCache = @{ src = $src; new = $new }
+}
+
+function Get-PowerLabel {
+    param([string]$State, [bool]$IsNew)
+    switch ($State) {
+        'running' { return 'RUNNING' }
+        'deallocated' { return 'DEALLOCATED (off)' }
+        'notfound' { if ($IsNew) { return 'NOT CREATED YET' } else { return 'NOT FOUND' } }
+        default { return $State.ToUpper() }
+    }
+}
+
+function Get-CurrentVmLines {
+    param([Parameter(Mandatory)]$C)
+    $moved = [bool]($script:State.steps.Keys | Where-Object { $_ -like 'p3.park-source-nic.*' })
+    $lines = @()
+    $lines += "Resource group : $($C.resourceGroup)"
+    $lines += "VM name        : $($C.vmName)"
+    $lines += "Size           : $($C.sourceSku)"
+    $lines += "Security type  : $(if ($C.securityType) { $C.securityType } else { 'Standard (none)' })"
+    $pips = @($C.nics | ForEach-Object { $_.ipConfigs } | Where-Object { $_.publicIp } | ForEach-Object { "$($_.publicIp.address) ($($_.publicIp.name))" })
+    $lines += "Public IP      : $(if ($pips) { ($pips -join ', ') + $(if ($moved) { ' - moved to the new VM' } else { '' }) } else { 'none' })"
+    $lines += "NICs           : $($C.nics.Count)"
+    foreach ($n in $C.nics) {
+        foreach ($i in $n.ipConfigs) {
+            $ph = $script:State.placeholders["$($n.name)|$($i.name)"]
+            $lines += "  $($n.name): $($i.privateIp) ($($i.allocation))$(if ($ph) { ' -> placeholder ' + $ph })"
+        }
+    }
+    $lines += "OS disk        : $($C.osDisk.name)"
+    if ($C.dataDisks.Count) {
+        $lines += 'Data disks     :'
+        foreach ($d in ($C.dataDisks | Sort-Object { [int]$_.lun })) { $lines += "  LUN $($d.lun)  $($d.name) ($($d.sizeGB) GB)" }
+    }
+    else { $lines += 'Data disks     : none' }
+    $lines += "Extensions     : $(if ($C.extensions.Count) { ($C.extensions | ForEach-Object { $_.name }) -join ', ' } else { 'none' })"
+    return $lines
+}
+
+function Get-NewVmLines {
+    param([Parameter(Mandatory)]$C)
+    if (-not $C.targetSku) { return @('(new size not chosen yet)') }
+    $lines = @()
+    $lines += "Resource group : $($C.resourceGroup)"
+    $lines += "VM name        : $(Get-TargetName $C.vmName -MaxLength 64)"
+    $lines += "Size           : $($C.targetSku) ($($C.skuFit))"
+    $lines += "Security type  : $(if ($C.securityType) { $C.securityType } else { 'Standard (none)' }) (same)"
+    $pips = @($C.nics | ForEach-Object { $_.ipConfigs } | Where-Object { $_.publicIp } | ForEach-Object { "$($_.publicIp.address) ($($_.publicIp.name))" })
+    $lines += "Public IP      : $(if ($pips) { ($pips -join ', ') + ' - taken from the old VM' } else { 'none' })"
+    $lines += "NICs           : $($C.nics.Count)"
+    foreach ($n in $C.nics) {
+        foreach ($i in $n.ipConfigs) { $lines += "  $(Get-TargetName $n.name): $($i.privateIp) (static, original IP)" }
+    }
+    $lines += "OS disk        : $(Get-TargetName $C.osDisk.name)"
+    if ($C.dataDisks.Count) {
+        $lines += 'Data disks     :'
+        foreach ($d in ($C.dataDisks | Sort-Object { [int]$_.lun })) { $lines += "  LUN $($d.lun)  $(Get-TargetName $d.name) ($($d.sizeGB) GB)" }
+    }
+    else { $lines += 'Data disks     : none' }
+    $restored = @($C.extensions | Where-Object { -not $_.skip -and -not $_.manual } | ForEach-Object { $_.name })
+    $manual = @($C.extensions | Where-Object { $_.manual } | ForEach-Object { $_.name })
+    $lines += "Extensions     : $(if ($restored) { $restored -join ', ' } else { 'none' })"
+    if ($manual) { $lines += "  not restored (manual): $($manual -join ', ')" }
+    return $lines
+}
+
+function Get-ProgressItems {
+    $c = $script:Config
+    $items = @()
+    $items += @{ key = 'p3.preflight'; label = 'Pre-flight checks' }
+    $items += @{ key = 'p3.stop-source'; label = "Shut down and deallocate $($c.vmName)" }
+    foreach ($d in @($c.osDisk) + @($c.dataDisks)) {
+        $isOs = ($d.name -eq $c.osDisk.name)
+        $tag = if ($isOs) { 'OS' } else { "LUN $($d.lun)" }
+        $items += @{ key = "p3.snapshot.$($d.name)"; label = "Snapshot $(Get-SnapshotName -Disk $d -IsOs $isOs)" }
+        $items += @{ key = "p3.disk.$($d.name)"; label = "Create disk $(Get-TargetName $d.name) ($tag)" }
+    }
+    foreach ($n in $c.nics) { $items += @{ key = "p3.park-source-nic.$($n.name)"; label = "Move old NIC $($n.name) to its placeholder IP, detach the public IP" } }
+    foreach ($n in $c.nics) { $items += @{ key = "p3.new-nic.$($n.name)"; label = "Create NIC $(Get-TargetName $n.name) with the original IP" } }
+    $items += @{ key = 'p3.new-vm'; label = "Create VM $(Get-TargetName $c.vmName -MaxLength 64)" }
+    foreach ($e in $c.extensions) {
+        if ($e.skip -or $e.manual) { continue }
+        $items += @{ key = "p3.extension.$($e.name)"; label = "Restore extension $($e.name)" }
+    }
+    return $items
+}
+
+function Show-Progress {
     Write-Host ''
+    Write-Host 'Progress' -ForegroundColor Cyan
+    foreach ($it in (Get-ProgressItems)) {
+        if ($script:State.steps.ContainsKey($it.key)) { Write-Host "  [x] $($it.label)" -ForegroundColor Green }
+        elseif ($script:CurrentStep -eq $it.key) { Write-Host "  [>] $($it.label)" -ForegroundColor Yellow }
+        else { Write-Host "  [ ] $($it.label)" -ForegroundColor DarkGray }
+    }
+}
+
+function Show-Screen {
+    param([string]$Title = 'AZURE VM SIZE MIGRATION', [switch]$RefreshPower, [switch]$Progress)
+    Clear-Screen
+    Write-Host $Title -ForegroundColor Cyan
+    Write-Host ('=' * ([Math]::Min((Get-ScreenWidth), 100) - 1)) -ForegroundColor DarkGray
+    if ($script:Config) {
+        if ($RefreshPower -or -not $script:PowerCache) { Update-PowerCache }
+        Write-Columns -Left (Get-CurrentVmLines -C $script:Config) -Right (Get-NewVmLines -C $script:Config) `
+            -LeftTitle "CURRENT VM - $(Get-PowerLabel $script:PowerCache.src $false)" -RightTitle "NEW VM - $(Get-PowerLabel $script:PowerCache.new $true)"
+    }
+    if ($Progress) { Show-Progress }
+    if ($script:Notices.Count) {
+        Write-Host ''
+        foreach ($n in $script:Notices) { Write-Host "  ! $n" -ForegroundColor Yellow }
+    }
+}
+
+# ======================================================================================================
+# GUIDED FLOW
+# ======================================================================================================
+
+function Show-Intro {
+    Clear-Screen
+    Write-Host 'AZURE VM SIZE MIGRATION VIA SNAPSHOT' -ForegroundColor Cyan
+    Write-Host ('=' * 60) -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host 'What this script does, for ONE VM:'
+    Write-Host '  1. reads the configuration of the VM and lets you choose the new size'
+    Write-Host '  2. shuts the VM down and takes a snapshot of every disk'
+    Write-Host '  3. rebuilds it as <name>-mig on the new size, with the same IP address'
+    Write-Host '  4. checks the result and leaves the ORIGINAL VM switched off and untouched'
+    Write-Host ''
+    Write-Host 'What it does not do:'
+    Write-Host '  - it never looks inside the guest operating system (those checks are yours)'
+    Write-Host '  - it never deletes the old VM, its NIC, disks or snapshots'
+    Write-Host '  - it does not move identity, load balancer membership, availability set, backup or locks:'
+    Write-Host '    it lists them before the start and you do them by hand'
+    Write-Host ''
+}
+
+function Confirm-ManualChecks {
+    Clear-Screen
+    Write-Host 'MANUAL CHECKS - to be completed by the team BEFORE you go on' -ForegroundColor Yellow
+    Write-Host ('=' * 60) -ForegroundColor DarkGray
+    Write-Host ''
+    @(
+        'Temp-disk remediation done (page file / swap, SQL tempdb, services and tasks on the temporary drive,'
+        '   /etc/fstab entries for /mnt) and the VM rebooted cleanly on its CURRENT size'
+        'The guest network interface is on DHCP: no static IPv4 address configured inside the operating system'
+        'Application owners informed, change window agreed'
+        'DNS, firewall and allow-list dependencies listed, so they can be reverted in case of rollback'
+        'Drive letters / mount points recorded (the script records disks and LUNs, not drive letters)'
+        'Backup situation known (the script does not touch backup)'
+    ) | ForEach-Object { Write-Host "  [ ] $_" }
+    Write-Host ''
+    return (Confirm-Action 'Have ALL the checks above been completed?')
+}
+
+function Show-ManualTests {
+    Write-Host ''
+    Write-Host 'TESTS TO DO NOW (guest and application, owned by the team):' -ForegroundColor Cyan
+    @(
+        'Guest interface is on DHCP and received the expected address (check inside the OS, not only the portal)'
+        'DNS servers correct; forward and reverse resolution working; no stale cached entries on clients'
+        'Drive letters / mount points match the pre-migration record (D: may have been reassigned)'
+        'Page file or swap on its new location, not on a temporary disk'
+        'No automatic-start service stopped, no failed systemd unit, no new errors in the system event log'
+        'Domain-joined Windows: AD trust relationship intact'
+        'SQL Server: service running and tempdb up from its relocated path'
+        'Application owner confirms a representative transaction, database connectivity and scheduled jobs'
+        'Inbound/outbound connectivity and reachability from dependent systems on the expected ports'
+    ) | ForEach-Object { Write-Host "  [ ] $_" }
+}
+
+function Show-Result {
+    param($Checks)
+    Show-Screen -Title 'MIGRATION COMPLETED' -RefreshPower
+    $fail = @($Checks | Where-Object { $_.Result -eq 'FAIL' })
+    $warn = @($Checks | Where-Object { $_.Result -eq 'WARN' })
+    Write-Host ''
+    Write-Host ("Automatic checks: {0} total, {1} passed, {2} FAILED, {3} warnings" -f $Checks.Count, @($Checks | Where-Object { $_.Result -eq 'PASS' }).Count, $fail.Count, $warn.Count) -ForegroundColor $(if ($fail.Count) { 'Red' } else { 'Green' })
+    foreach ($f in @($fail) + @($warn)) { Write-Host ("  {0,-5} {1} / {2}: expected '{3}', found '{4}'" -f $f.Result, $f.Area, $f.Check, $f.Expected, $f.Actual) -ForegroundColor $(if ($f.Result -eq 'FAIL') { 'Red' } else { 'Yellow' }) }
+    Write-Host "Full report: $($script:Paths.Report)" -ForegroundColor DarkGray
+    $c = $script:Config
+    if ($c.complications.Count) {
+        Write-Host ''
+        Write-Host 'STILL TO DO BY HAND on the new VM:' -ForegroundColor Yellow
+        foreach ($x in $c.complications) { Write-Host "  - $x" -ForegroundColor Yellow }
+    }
+    Show-ManualTests
+    Write-Host ''
+    Write-Host "KEEP THE SOURCE VM '$($c.vmName)' SWITCHED OFF while you test '$(Get-TargetName $c.vmName -MaxLength 64)'." -ForegroundColor Yellow
+    Write-Host 'Both machines share hostname, SID and AD computer account: starting both can break the AD trust.' -ForegroundColor Yellow
+    Write-Host 'After the owner has signed off, the old VM, NIC, disks and snapshots are removed by hand.' -ForegroundColor Yellow
+    Write-Host ''
+}
+
+function Show-ResumeMenu {
+    # Returns 'resume', 'validate', 'rollback' or 'quit'.
+    $done = (Get-PhaseStatus 3) -in 'done', 'done-with-warnings'
+    Show-Screen -Title 'A MIGRATION OF THIS VM ALREADY EXISTS' -RefreshPower -Progress
+    Write-Host ''
+    if ($done) { Write-Host '  [V] Run the automatic checks again' } else { Write-Host '  [R] Resume the deployment from the last completed step' }
+    Write-Host '  [B] Roll back (delete the new VM, give the original IP back to the old VM and start it)'
+    Write-Host '  [Q] Quit'
+    while ($true) {
+        $a = (Read-Host 'Choose').Trim().ToUpper()
+        if ($a -eq 'Q') { return 'quit' }
+        if ($a -eq 'B') { return 'rollback' }
+        if ($done -and $a -eq 'V') { return 'validate' }
+        if (-not $done -and $a -eq 'R') { return 'resume' }
+    }
+}
+
+function Invoke-Deployment {
+    $script:OnStepChanged = {
+        param($StepName, $After)
+        Show-Screen -Title 'DEPLOYING - do not close this window' -Progress -RefreshPower:($After -and ($StepName -match 'stop-source|new-vm'))
+    }
+    try { Invoke-Execute }
+    finally { $script:OnStepChanged = $null }
 }
 
 function Start-Migration {
-    Write-Host ''
-    Write-Host 'Azure VM size migration via snapshot - control-plane only, one VM at a time' -ForegroundColor Cyan
-    Test-Prerequisites
-    Connect-Target
-    if (-not $script:ResourceGroupName) { $script:ResourceGroupName = Read-Required 'Resource group of the VM' }
-    if (-not $script:VmName) { $script:VmName = Read-Required 'VM name' }
-    $null = Get-AzVM -ResourceGroupName $script:ResourceGroupName -Name $script:VmName
-    Initialize-Workspace
+    $script:UiActive = $true
+    try {
+        Show-Intro
+        Test-Prerequisites
+        Connect-Target
+        Select-Vm
+        Initialize-Workspace
+        $action = 'new'
+        if ($script:State.phase3Started) { $action = Show-ResumeMenu }
 
-    $actions = [ordered]@{
-        '1' = @{ Label = 'Capture source configuration'; Run = { Invoke-Phase1 } }
-        '2' = @{ Label = 'Network preparation';          Run = { Invoke-Phase2 } }
-        '3' = @{ Label = 'Execute migration';            Run = { Invoke-Phase3 } }
-        '4' = @{ Label = 'Validate';                     Run = { Invoke-Phase4 } }
-        '5' = @{ Label = 'Rollback';                     Run = { Invoke-Phase5 } }
+        switch ($action) {
+            'quit' { return }
+            'rollback' {
+                Invoke-Rollback
+                $script:UiActive = $true
+                Write-Host ''
+                Read-Host 'Press Enter to exit' | Out-Null
+                return
+            }
+            'validate' {
+                Write-Busy 'Running the automatic checks...'
+                $checks = Invoke-Validate
+                Show-Result -Checks $checks
+                Read-Host 'Press Enter to exit' | Out-Null
+                return
+            }
+            'new' {
+                if (-not (Confirm-ManualChecks)) { Write-Host 'Stopped: complete the manual checks first.' -ForegroundColor Yellow; return }
+                $script:State.attestations += @{ type = 'manual-checks-confirmed'; by = $env:USERNAME; at = (Get-Date).ToString('o') }
+                Save-State
+
+                Write-Busy 'Reading the VM configuration (disks, network, extensions)...'
+                if (-not (Invoke-Capture)) {
+                    Show-Screen -Title 'THIS VM CANNOT BE MIGRATED BY THE SCRIPT'
+                    Write-Host ''
+                    foreach ($b in $script:LastBlockers) { Write-Host "  BLOCKER: $b" -ForegroundColor Red }
+                    Write-Host ''
+                    return
+                }
+                Select-TargetSku
+                Set-PlaceholderIps
+                $taken = @(Test-TargetNamesFree)
+                if ($taken.Count) {
+                    Show-Screen -Title 'NAMES ALREADY IN USE'
+                    foreach ($t in $taken) { Write-Host "  already exists: $t" -ForegroundColor Red }
+                    Write-Host 'Remove or rename these resources (or roll back an earlier attempt), then run the script again.' -ForegroundColor Red
+                    return
+                }
+
+                Show-Screen -Title 'DEPLOYMENT PLAN' -RefreshPower
+                if ($script:Config.warnings.Count -or $script:Config.complications.Count) {
+                    Write-Host ''
+                    foreach ($w in $script:Config.warnings) { Write-Host "  note: $w" -ForegroundColor DarkYellow }
+                }
+                if ($script:Config.complications.Count) {
+                    Write-Host ''
+                    Write-Host 'NOT HANDLED BY THIS SCRIPT - the new VM is created without these, you do them by hand:' -ForegroundColor Yellow
+                    foreach ($x in $script:Config.complications) { Write-Host "  - $x" -ForegroundColor Yellow }
+                    Write-Host ''
+                    if (-not (Confirm-Typed 'Acknowledge that these are handled by hand' 'ACKNOWLEDGE')) { Write-Host 'Not acknowledged: nothing was changed.' -ForegroundColor Yellow; return }
+                    $script:State.attestations += @{ type = 'complications-acknowledged'; count = $script:Config.complications.Count; by = $env:USERNAME; at = (Get-Date).ToString('o') }
+                    Save-State
+                }
+                Write-Host ''
+                Write-Host "The old VM '$($script:Config.vmName)' will be shut down. Nothing of it is deleted." -ForegroundColor Cyan
+                if (-not (Confirm-Action 'Proceed with the deployment?')) { Write-Host 'Cancelled: nothing was changed.' -ForegroundColor Yellow; return }
+            }
+        }
+
+        Invoke-Deployment
+        Write-Busy 'Running the automatic checks...'
+        $checks = Invoke-Validate
+        Show-Result -Checks $checks
+        Read-Host 'Press Enter to exit' | Out-Null
     }
-    while ($true) {
-        Show-Status
-        foreach ($k in $actions.Keys) { Write-Host "  [$k] $($actions[$k].Label)" }
-        Write-Host '  [Q] Quit'
-        $choice = (Read-Host 'Choose').Trim().ToUpper()
-        if ($choice -eq 'Q') { break }
-        if (-not $actions.Contains($choice)) { continue }
-        try { & $actions[$choice].Run }
-        catch {
-            Write-Log "Phase $choice stopped: $($_.Exception.Message)" 'ERROR'
+    catch {
+        $script:UiActive = $false
+        Write-Host ''
+        Write-Host "STOPPED: $($_.Exception.Message)" -ForegroundColor Red
+        if ($script:Paths) {
             Add-Content -Path $script:Paths.Log -Value $_.ScriptStackTrace
-            Write-Log 'State is saved. Fix the cause and re-run the phase to resume, or roll back (phase 5).' 'WARN'
+            Write-Host "The state is saved in $($script:Paths.Dir). Fix the cause and run the script again on the same VM: you can resume or roll back." -ForegroundColor Yellow
         }
     }
-    Write-Log 'Bye.'
+    finally { $script:UiActive = $false; $script:OnStepChanged = $null }
 }
 
-# Dot-sourcing (". .\Invoke-VmSkuMigration.ps1") loads the functions without starting the menu.
+# Dot-sourcing (". .\Invoke-VmSkuMigration.ps1") loads the functions without starting the guided flow.
 if ($MyInvocation.InvocationName -ne '.') { Start-Migration }

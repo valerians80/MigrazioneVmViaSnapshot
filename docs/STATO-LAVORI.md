@@ -86,3 +86,26 @@ Rispondere `y` alla subscription, poi `4` per la validazione. Per ripulire tutto
 ```powershell
 .\testenv\New-MigrationTestEnvironment.ps1 -Destroy -TenantId <TENANT-ID>
 ```
+
+
+---
+
+## Aggiornamento del 06/10/2026: percorso guidato
+
+Lo script è stato riscritto come **percorso guidato unico** (niente più menu a fasi), come richiesto:
+
+- schermo pulito e spiegazione; `Connect-AzAccount`; subscription da elenco; nome VM (il resource group lo trova da solo)
+- promemoria dei check manuali con conferma Y/N
+- schermata a due colonne: **VM attuale (verde, sinistra)** e **VM nuova (rossa, destra)**, ridisegnata dopo ogni passo, con stato acceso/deallocata
+- scelta della nuova taglia da un elenco del playbook, controllata sulla subscription (region, zona, quota, generazione, nessuna riduzione di capacità)
+- IP placeholder preso automaticamente (primo libero della subnet) per ogni NIC della VM vecchia; la nuova NIC prende l'IP originale; se non c'è un IP libero, si ferma
+- riepilogo del piano, elenco del "non gestito" con `ACKNOWLEDGE`, poi Y/N per il deploy
+- deploy con lista di avanzamento, controlli automatici, e a fine corsa i test da fare con il promemoria di **tenere spenta la VM sorgente**
+- rilanciando lo script su una VM già migrata: riprendi / ricontrolla / **rollback**
+- snapshot con il LUN nel nome: `<disco>-snap-os-mig` e `<disco>-snap-lun<N>-mig` (il rollback toglie anche i vecchi `<disco>-snap-mig`)
+
+Il test con Azure simulato è stato riscritto sul nuovo percorso (errore e ripresa, controlli ripetuti, rollback, seconda migrazione).
+Non ancora provato su Azure reale dopo la riscrittura: **il prossimo test reale è la prova del nuovo percorso**.
+
+Nota per il test già in corso: la migrazione di `vmmigtest01` fatta con la versione precedente ha snapshot con il nome vecchio;
+il nuovo script li riconosce (entrambi i nomi) quando si esegue il rollback.

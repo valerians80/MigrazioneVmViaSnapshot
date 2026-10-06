@@ -21,11 +21,39 @@ The script never touches the guest OS. Temp-disk remediation and every in-guest 
 
 ```powershell
 .\Invoke-VmSkuMigration.ps1
-# optional, skips the matching prompts:
-.\Invoke-VmSkuMigration.ps1 -TenantId <id> -SubscriptionId <id> -ResourceGroupName <rg> -VmName <vm>
+# optional, skips the matching questions:
+.\Invoke-VmSkuMigration.ps1 -TenantId <id> -SubscriptionId <id> -VmName <vm>
 ```
 
 The size mapping and the extension skip lists are at the top of the script.
+
+## The guided flow
+
+1. The screen is cleared and the script explains what it does and what it does not.
+2. `Connect-AzAccount`, the subscription where the VM lives (from a list), the VM name (the resource group is found for you).
+3. The manual checks to be done inside the guest are listed; you confirm Y/N that they are all done.
+4. The VM is read and a two-column screen is shown, redrawn after every step: **CURRENT VM** (green, left) and
+   **NEW VM** (red, right), with resource group, name, size, security type, public IP, NICs with IPs, OS disk,
+   data disks with LUN, extensions, and the power state of both machines.
+5. You choose the new size from the playbook list. Each size is checked against the subscription (region, zone,
+   quota, Hyper-V generation, no reduction of vCPU/memory).
+6. For every IP configuration the first free address of its subnet is taken as placeholder for the old NIC;
+   the new NIC takes over the original address. If no address is free, the script stops.
+7. The plan is shown (old VM with the placeholder IPs, new VM with everything that will be applied) together
+   with what the script does **not** handle. You type `ACKNOWLEDGE`, then confirm Y/N to deploy.
+8. Deployment, with a progress list: shut down the old VM, snapshots, new disks, old NIC moved to the placeholder,
+   new NIC with the original IP, new VM, extensions.
+9. Automatic checks compare the new VM with the recorded configuration (`validation-report.csv`), then the
+   tests to do are listed with a reminder to **keep the old VM switched off**.
+
+If the VM already has a migration, running the script again offers: resume the deployment (checkpoint per step),
+run the automatic checks again, or **roll back** (delete the new VM and NICs, give the original IP and public IP
+back to the old NIC, start the old VM).
+
+Naming: VM, NICs and disks get the suffix `-mig`; snapshots are `<disk>-snap-os-mig` (OS disk) and
+`<disk>-snap-lun<N>-mig` (data disks), so the LUN is visible in the name for any manual intervention.
+Per-VM files live in `.\migration\<vmName>\` (`config.json`, `state.json`, `migration.log`, `validation-report.csv`):
+run the script from the same folder to find them again.
 
 ## What the script recreates
 
@@ -39,23 +67,13 @@ extensions that do not need protected settings.
 Managed identities (system and user-assigned, with their role assignments and Key Vault policies), load balancer /
 application gateway pools and NAT rules, availability set and proximity placement group, Azure Backup, resource
 locks, data collection rule associations, capacity reservation, extensions with protected settings.
-Phase 1 lists them, phase 2 requires typing `ACKNOWLEDGE`, phase 3 and 4 repeat the list.
+They are listed before the start and you must type `ACKNOWLEDGE`.
 
-## Phases
+The VM is not migrated at all (the script stops and says why) when: no target size is usable in the subscription,
+the VM has Azure Disk Encryption, an ephemeral / shared / Ultra / PremiumV2 disk, is a scale-set member, has an
+IPv6 configuration or no free placeholder IP exists.
 
-| # | Phase | Changes Azure? | What it does |
-|---|-------|----------------|--------------|
-| 1 | Capture | no | Writes `config.json` and lists the items above. Blocks unsupported cases: size not available in region/zone, target without Gen1 support, vCPU quota, ADE, ephemeral/shared/Ultra/PremiumV2 disks, scale-set member, IPv6. |
-| 2 | Network prep | no | Checks the `-mig` names are free, chooses and verifies one placeholder IP per IP configuration, collects the acknowledgements. |
-| 3 | Execute | yes | Deallocates the source, takes full snapshots, creates new disks, parks the source NIC on the placeholder IP, creates the new NIC and VM, restores extensions. |
-| 4 | Validate | no | Compares the new VM with `config.json`, writes `validation-report.csv`, saves the boot-diagnostics screenshot, prints the manual checklist. |
-| 5 | Rollback | yes | Deletes the **new** VM and NICs, restores the original IP and public IP on the source NIC, starts the source. Resets phases 3 and 4 so the migration can be retried. |
-
-Naming: VM, NICs and disks get the suffix `-mig`; snapshots are `<disk>-snap-mig`.
-Per-VM files live in `.\migration\<vmName>\` (`config.json`, `state.json`, `migration.log`, `validation-report.csv`).
-Phase 3 checkpoints every step: re-run it to resume after a failure.
-
-## After a successful validation (manual)
+## After a successful migration (manual)
 
 After the owner's formal sign-off: remove the old VM, NIC, disks and snapshots (default retention 14 days), and
 enable backup on the new VM once the old backup item is dealt with.
@@ -64,12 +82,13 @@ enable backup on the new VM once the old backup item is dealt with.
 
 - Source and replacement VM are never both allowed to run (checked before creating the replacement and before starting the source).
 - The script only deletes resources it created itself, and only in rollback.
-- Phase 3 does not start without `config.json`, the placeholder IPs and the acknowledgements from phase 2.
+- The deployment does not start without the manual-checks confirmation, the acknowledgement and the final Y/N.
 
 ## Known limits
 
 - Extensions with protected settings (custom script, domain join, MMA/OMS, DSC) cannot be read back: they are reported.
 - The replacement VM uses managed boot diagnostics.
+- The security type of the new OS disk is inherited from the snapshot (it cannot be set when copying); the script warns if it differs.
 - Rollback deletes the new VM/NICs; it does not offer a "park the new NIC on a placeholder" variant.
 
 ## Test environment (one subscription)
@@ -101,7 +120,7 @@ when a NSG, public IP or VNet it needs lives elsewhere.
 
 ## Tests
 
-`tests/Invoke-VmSkuMigration.MockTest.ps1` runs phases 1-5 (including a rollback and a second migration) against an
+`tests/Invoke-VmSkuMigration.MockTest.ps1` runs the whole guided flow (a failure and resume, repeated checks, rollback, a second migration) against an
 in-memory fake of the Az cmdlets. It checks the script's logic, ordering and checkpointing, **not** the real
 Azure parameter surface: run the first migrations in a test subscription.
 

@@ -1,7 +1,8 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $work = Join-Path ([IO.Path]::GetTempPath()) ("migtest-" + [guid]::NewGuid().ToString('N').Substring(0, 6))
-. "$root/Invoke-VmSkuMigration.ps1" -TenantId 't1' -SubscriptionId 's1' -ResourceGroupName 'rg1' -VmName 'vm1' -WorkRoot $work
+. "$root/Invoke-VmSkuMigration.ps1" -TenantId 't1' -SubscriptionId 's1' -VmName 'vm1' -WorkRoot $work
+$script:ClearScreen = $false
 
 # ---------- helper unit tests ----------
 function Assert($cond, $msg) { if (-not $cond) { throw "ASSERT FAILED: $msg" } else { Write-Host "ok  - $msg" -ForegroundColor Green } }
@@ -16,6 +17,7 @@ try { Get-TargetName ('x' * 80); $bad = $true } catch { $bad = $false }
 Assert (-not $bad) 'name too long rejected'
 
 # ---------- in-memory Azure ----------
+function Get-Module { param([switch]$ListAvailable, $Name) [pscustomobject]@{ Name = $Name } }
 $global:Az = @{ vms = @{}; disks = @{}; snaps = @{}; nics = @{}; locks = @(); calls = [System.Collections.Generic.List[string]]::new() }
 function Rec($m) { $global:Az.calls.Add($m) }
 $sub = '/subscriptions/s1/resourceGroups/rg1/providers'
@@ -41,7 +43,7 @@ $global:Az.disks['data1'] = O @{ Name = 'data1'; Id = "$sub/Microsoft.Compute/di
     SecurityProfile = $null; Encryption = (O @{ DiskEncryptionSetId = ''; Type = '' }); MaxShares = $null; EncryptionSettingsCollection = $null; Tags = $null }
 
 $global:Az.vms['vm1'] = [pscustomobject]@{
-    Name = 'vm1'; Id = "$sub/Microsoft.Compute/virtualMachines/vm1"; Location = 'westeurope'; Zones = @('1'); Tags = @{ app = 'x'; env = 'test' }
+    Name = 'vm1'; ResourceGroupName = 'rg1'; Id = "$sub/Microsoft.Compute/virtualMachines/vm1"; Location = 'westeurope'; Zones = @('1'); Tags = @{ app = 'x'; env = 'test' }
     LicenseType = 'Windows_Server'; Plan = $null; Priority = $null; Power = 'running'
     AvailabilitySetReference = $null; ProximityPlacementGroup = $null; VirtualMachineScaleSet = $null; AdditionalCapabilities = $null; CapacityReservation = $null
     HardwareProfile = (O @{ VmSize = 'Standard_B2ms' })
@@ -57,8 +59,11 @@ $global:Az.vms['vm1'] = [pscustomobject]@{
 
 $global:CurSub = 's1'
 function Get-AzContext { O @{ Account = (O @{ Id = 'tester@x' }); Tenant = (O @{ Id = 't1' }); Subscription = (O @{ Id = $global:CurSub; Name = 'sub' }) } }
-function Set-AzContext { param($SubscriptionId, $Tenant) Rec "ctx $SubscriptionId"; $global:CurSub = $SubscriptionId }
+function Set-AzContext { param($SubscriptionId, $Tenant) Rec "ctx $SubscriptionId"; $global:CurSub = $SubscriptionId; O @{ Account = (O @{ Id = 'tester@x' }) } }
+function Connect-AzAccount { param($Tenant) Rec 'connect' }
+function Get-AzSubscription { param($TenantId) @(O @{ Id = 's1'; Name = 'test-sub'; State = 'Enabled'; TenantId = 't1' }) }
 function Get-AzVM { param($ResourceGroupName, $Name, [switch]$Status)
+    if (-not $Name) { return @($global:Az.vms.Values) }
     $v = $global:Az.vms[$Name]; if (-not $v) { throw "ResourceNotFound: VM $Name" }
     if ($Status) { return O @{ Statuses = @(O @{ Code = "PowerState/$($v.Power)" }) } }
     return $v }
@@ -119,7 +124,7 @@ function Invoke-AzRestMethod { param($Method, $Path, $Payload) Rec "rest $Method
 function Get-AzComputeResourceSku { param($Location)
     $mk = { param($n, $f, $c, $m, $g) O @{ ResourceType = 'virtualMachines'; Name = $n; Family = $f; Restrictions = @(); LocationInfo = @(O @{ Location = 'westeurope'; Zones = @('1', '2', '3') })
             Capabilities = @(O @{ Name = 'vCPUs'; Value = "$c" }; O @{ Name = 'MemoryGB'; Value = "$m" }; O @{ Name = 'HyperVGenerations'; Value = $g }) } }
-    & $mk 'Standard_B2ms' 'standardBSFamily' 2 8 'V1,V2'; & $mk 'Standard_B2s_v2' 'standardBsv2Family' 2 8 'V2'; & $mk 'Standard_B2ls_v2' 'standardBsv2Family' 2 4 'V2' }
+    & $mk 'Standard_B2ms' 'standardBSFamily' 2 8 'V1,V2'; & $mk 'Standard_B2s_v2' 'standardBsv2Family' 2 8 'V2'; & $mk 'Standard_B2ls_v2' 'standardBsv2Family' 2 4 'V2'; & $mk 'Standard_B4s_v2' 'standardBsv2Family' 4 16 'V2' }
 function Get-AzVMUsage { param($Location) @(O @{ Name = (O @{ Value = 'standardBsv2Family' }); CurrentValue = 0; Limit = 100 }) }
 function New-AzVMConfig { param($VMName, $VMSize, $AvailabilitySetId, $Zone, $ProximityPlacementGroupId, $LicenseType, $Tags, [switch]$EncryptionAtHost, $IdentityType, $IdentityId) Rec "vmconfig size=$VMSize zone=$Zone lic=$LicenseType idt=$IdentityType"; @{ name = $VMName; size = $VMSize; nics = @(); disks = @(); zone = $Zone; tags = $Tags; lic = $LicenseType; ident = $IdentityType } }
 function Set-AzVMSecurityProfile { param($VM, $SecurityType) $VM.sec = $SecurityType; $VM }
@@ -129,10 +134,11 @@ function Add-AzVMDataDisk { param($VM, $Name, $ManagedDiskId, $Lun, $CreateOptio
 function Add-AzVMNetworkInterface { param($VM, $Id, [switch]$Primary) $VM.nics += $Id; $VM }
 function Set-AzVMBootDiagnostic { param($VM, [switch]$Enable, [switch]$Disable) $VM }
 function New-AzVM { param($ResourceGroupName, $Location, $VM, [switch]$DisableBginfoExtension)
+    if ($global:FailVmOnce) { $global:FailVmOnce = $false; throw 'simulated New-AzVM failure' }
     Rec "new-vm $($VM.name)"
     $d = foreach ($x in $VM.disks) { @{ Lun = $x.lun; Name = (Split-Path $x.id -Leaf); ManagedDisk = @{ Id = $x.id }; Caching = $x.cache; DiskSizeGB = $global:Az.disks[(Split-Path $x.id -Leaf)].DiskSizeGB } }
     $global:Az.vms[$VM.name] = [pscustomobject]@{
-        Name = $VM.name; Id = "$sub/Microsoft.Compute/virtualMachines/$($VM.name)"; Location = 'westeurope'; Zones = @($VM.zone); Tags = $VM.tags; LicenseType = $VM.lic; Power = 'running'; ProvisioningState = 'Succeeded'
+        Name = $VM.name; ResourceGroupName = 'rg1'; Id = "$sub/Microsoft.Compute/virtualMachines/$($VM.name)"; Location = 'westeurope'; Zones = @($VM.zone); Tags = $VM.tags; LicenseType = $VM.lic; Power = 'running'; ProvisioningState = 'Succeeded'
         AvailabilitySetReference = $null; HardwareProfile = (O @{ VmSize = $VM.size }); SecurityProfile = (O @{ SecurityType = $VM.sec }); DiagnosticsProfile = (O @{ BootDiagnostics = (O @{ Enabled = $true }) })
         Identity = (O @{ Type = 'SystemAssigned'; PrincipalId = 'pid-new'; UserAssignedIdentities = $null })
         StorageProfile = (O @{ OsDisk = (O @{ Caching = $VM.oscache }); DataDisks = @($d | % { O $_ }) })
@@ -145,85 +151,74 @@ function Update-AzVM2 {}
 $global:Answers = [System.Collections.Generic.Queue[string]]::new()
 function Read-Host { param($Prompt) if ($global:Answers.Count -eq 0) { throw "Prompt without scripted answer: $Prompt" }; $a = $global:Answers.Dequeue(); Write-Host "   <$Prompt> => $a" -ForegroundColor DarkGray; $a }
 function Say { param([string[]]$a) foreach ($x in $a) { $global:Answers.Enqueue($x) } }
+function Assert-NoLeftoverAnswers { if ($global:Answers.Count) { throw "Unused scripted answers: $($global:Answers -join ', ')" } }
 
-Initialize-Workspace
+# ================= RUN 1: new migration, deployment fails at VM creation =================
+Write-Host "`n===== RUN 1: new migration (VM creation fails once) =====" -ForegroundColor Cyan
+$global:FailVmOnce = $true
+Say 'y', 'y', '', 'ACKNOWLEDGE', 'y'   # reuse session, manual checks done, accept proposed size, acknowledge, proceed
+Start-Migration
+Assert-NoLeftoverAnswers
+Assert ($script:Config.targetSku -eq 'Standard_B2s_v2' -and $script:Config.skuFit -eq 'Exact') 'size chosen and recorded'
+Assert ($script:State.placeholders['nic1|ipconfig1'] -eq '10.0.1.50') 'placeholder IP taken automatically'
+Assert ($script:State.steps.ContainsKey('p3.snapshot.os1') -and $script:State.steps.ContainsKey('p3.disk.os1')) 'steps before the failure are checkpointed'
+Assert (-not $script:State.steps.ContainsKey('p3.new-vm')) 'failed step is not marked done'
+Assert (-not $global:Az.vms.ContainsKey('vm1-mig')) 'no replacement VM yet'
+Assert ($global:Az.snaps.ContainsKey('os1-snap-os-mig') -and $global:Az.snaps.ContainsKey('data1-snap-lun2-mig')) 'snapshot names carry OS / LUN'
+Assert ($global:Az.nics['nic1'].IpConfigurations[0].PrivateIpAddress -eq '10.0.1.50') 'old NIC parked'
 
-Write-Host "`n===== PHASE 1 =====" -ForegroundColor Cyan
-Say 'Standard_B2s_v2'                    # target size (suggested is B2s_v2)
-Invoke-Phase1
-Assert ((Get-PhaseStatus 1) -eq 'done') 'phase 1 done'
-Assert ($script:Config.targetSku -eq 'Standard_B2s_v2' -and $script:Config.skuFit -eq 'Exact') 'target + fit recorded'
-$cx = $script:Config.complications -join ' | '
-Assert ($cx -match 'System-assigned managed identity') 'complication: system identity flagged'
-Assert ($cx -match 'Load balancer') 'complication: load balancer flagged'
-Assert ($cx -match 'Data collection rule') 'complication: DCR flagged'
-Assert ($cx -match 'CustomScriptExtension') 'complication: protected-settings extension flagged'
+$cur = (Get-CurrentVmLines -C $script:Config) -join "`n"
+$new = (Get-NewVmLines -C $script:Config) -join "`n"
+Assert ($cur -match 'vm1' -and $cur -match 'Standard_B2ms' -and $cur -match 'LUN 2' -and $cur -match 'placeholder 10.0.1.50') 'left column: current VM with placeholder'
+Assert ($new -match 'vm1-mig' -and $new -match 'Standard_B2s_v2' -and $new -match '10.0.1.10' -and $new -match 'data1-mig') 'right column: new VM'
+Assert ($new -match 'not restored \(manual\): CustomScriptExtension') 'right column: manual extension listed'
 
-Write-Host "`n===== PHASE 2 =====" -ForegroundColor Cyan
-Say '10.0.1.10', '10.0.2.5', '10.0.1.50', 'nope'   # original (rejected), outside subnet (rejected), valid placeholder, wrong acknowledgement
-Invoke-Phase2
-Assert ((Get-PhaseStatus 2) -ne 'done') 'phase 2 refuses without ACKNOWLEDGE'
-Say 'y', '10.0.1.50', 'ACKNOWLEDGE', 'YES'   # keep placeholder, acknowledge complications, guest pre-checks
-Invoke-Phase2
-Assert ((Get-PhaseStatus 2) -eq 'done') 'phase 2 done'
-Assert ($global:Az.calls -contains 'ctx s2') 'phase 2 switched to the VNet subscription'
-Assert ($global:CurSub -eq 's1') 'context restored to the VM subscription'
-Assert ($script:State.placeholders['nic1|ipconfig1'] -eq '10.0.1.50') 'placeholder stored'
-
-Write-Host "`n===== PHASE 3 =====" -ForegroundColor Cyan
-Say 'y'
-Invoke-Phase3
-$s = $script:State
-Assert ($global:Az.vms['vm1'].Power -eq 'deallocated') 'source deallocated'
-Assert ($global:Az.nics['nic1'].IpConfigurations[0].PrivateIpAddress -eq '10.0.1.50') 'source NIC parked'
-Assert ($global:Az.nics['nic1'].IpConfigurations[0].PublicIpAddress -eq $null) 'public IP detached from source'
-Assert ($global:Az.nics['nic1-mig'].IpConfigurations[0].PrivateIpAddress -eq '10.0.1.10') 'new NIC has original IP'
-Assert ($global:Az.vms['vm1-mig'].Power -eq 'running') 'new VM running'
-Assert ($global:Az.vms['vm1-mig'].HardwareProfile.VmSize -eq 'Standard_B2s_v2') 'new VM size'
-Assert ($global:Az.disks.ContainsKey('os1-mig') -and $global:Az.disks.ContainsKey('data1-mig')) 'new disks'
-Assert ($global:Az.snaps.ContainsKey('os1-snap-mig') -and $global:Az.snaps.ContainsKey('data1-snap-mig')) 'snapshots'
+# ================= RUN 2: resume =================
+Write-Host "`n===== RUN 2: resume =====" -ForegroundColor Cyan
+Say 'y', 'r', ''
+Start-Migration
+Assert-NoLeftoverAnswers
+Assert ($global:Az.vms['vm1-mig'].Power -eq 'running') 'replacement VM created after resume'
+Assert ((Get-PhaseStatus 3) -eq 'done') 'deployment done'
+Assert ((Get-PhaseStatus 4) -eq 'PASS') 'automatic checks PASS'
 Assert ($global:ExtAdded -contains 'AzureMonitorWindowsAgent' -and $global:ExtAdded -notcontains 'CustomScriptExtension') 'extensions: restored vs manual'
 Assert ($global:RoleAdded.Count -eq 0) 'no role assignments touched'
 Assert (@($global:Az.calls | ? { $_ -like 'rest PUT' -or $_ -like 'rest DELETE' -or $_ -like 'lock*' -or $_ -like 'role*' }).Count -eq 0) 'no DCR write, lock or role calls'
 Assert ($global:Az.nics['nic1-mig'].IpConfigurations[0].LoadBalancerBackendAddressPools.Count -eq 0) 'new NIC not added to LB pool (flagged only)'
-Assert ($global:Az.nics['nic1'].IpConfigurations[0].LoadBalancerBackendAddressPools.Count -eq 1) 'source NIC pool membership untouched'
-Assert ($global:Az.calls -notcontains 'remove-vm vm1' -and -not (@($global:Az.calls | ? { $_ -like 'remove-*' }).Count)) 'nothing deleted in phase 3'
-Assert ((Get-PhaseStatus 3) -eq 'done') 'phase 3 status'
-Assert ($global:Az.calls.IndexOf('stop vm1') -lt $global:Az.calls.IndexOf('new-vm vm1-mig')) 'order: stop before create'
-Assert (@($global:Az.calls | ? { $_ -like 'start vm1' }).Count -eq 0) 'source never started in phase 3'
+Assert ($global:Az.nics['nic1'].IpConfigurations[0].LoadBalancerBackendAddressPools.Count -eq 1) 'old NIC pool membership untouched'
+Assert (-not (@($global:Az.calls | ? { $_ -like 'remove-*' }).Count)) 'nothing deleted by the migration'
+Assert ($global:Az.vms['vm1'].Power -eq 'deallocated') 'old VM left deallocated'
+Assert (@($global:Az.calls | ? { $_ -eq 'start vm1' }).Count -eq 0) 'old VM never started'
+$idxStop = $global:Az.calls.IndexOf('stop vm1'); $idxNew = $global:Az.calls.IndexOf('new-vm vm1-mig')
+Assert ($idxStop -ge 0 -and $idxStop -lt $idxNew) 'order: old VM stopped before the new one is created'
 
-Write-Host "`n===== PHASE 3 re-run (must be a no-op) =====" -ForegroundColor Cyan
-$before = $global:Az.calls.Count
-Say 'y'
-Invoke-Phase3
-Assert ($global:Az.calls.Count -eq $before) 're-run executes no Azure calls'
+# ================= RUN 3: existing finished migration -> checks again =================
+Write-Host "`n===== RUN 3: run the checks again =====" -ForegroundColor Cyan
+Say 'y', 'v', ''
+Start-Migration
+Assert-NoLeftoverAnswers
+Assert ((Get-PhaseStatus 4) -eq 'PASS') 'checks repeated: PASS'
 
-Write-Host "`n===== PHASE 4 =====" -ForegroundColor Cyan
-Say 'y', 'Alice'
-Invoke-Phase4
-$fails = @($script:Checks | ? Result -eq 'FAIL')
-$fails | Format-Table -AutoSize | Out-String | Write-Host
-Assert ($fails.Count -eq 0) 'no failing platform check'
-Assert ((Get-PhaseStatus 4) -eq 'PASS') 'phase 4 PASS'
+# ================= RUN 4: rollback =================
+Write-Host "`n===== RUN 4: rollback =====" -ForegroundColor Cyan
+Say 'y', 'b', 'y', 'test rollback', 'y', ''
+Start-Migration
+Assert-NoLeftoverAnswers
+Assert (-not $global:Az.vms.ContainsKey('vm1-mig') -and -not $global:Az.nics.ContainsKey('nic1-mig')) 'new VM and NIC removed'
+Assert ($global:Az.nics['nic1'].IpConfigurations[0].PrivateIpAddress -eq '10.0.1.10') 'old NIC original IP restored'
+Assert ($global:Az.nics['nic1'].IpConfigurations[0].PublicIpAddress.Id -eq $pipId) 'public IP restored on the old NIC'
+Assert ($global:Az.vms['vm1'].Power -eq 'running') 'old VM running again'
+Assert (-not $global:Az.disks.ContainsKey('os1-mig') -and -not $global:Az.snaps.ContainsKey('os1-snap-os-mig')) 'new storage deleted'
+Assert (-not $script:State.phase3Started) 'state reset after rollback'
 
-Write-Host "`n===== PHASE 5 (rollback) =====" -ForegroundColor Cyan
-Say 'y', 'test rollback', 'y'
-Invoke-Phase5
-Assert (-not $global:Az.vms.ContainsKey('vm1-mig')) 'new VM removed'
-Assert (-not $global:Az.nics.ContainsKey('nic1-mig')) 'new NIC removed'
-Assert ($global:Az.nics['nic1'].IpConfigurations[0].PrivateIpAddress -eq '10.0.1.10') 'source NIC original IP restored'
-Assert ($global:Az.nics['nic1'].IpConfigurations[0].PublicIpAddress.Id -eq $pipId) 'public IP restored on source'
-Assert ($global:Az.vms['vm1'].Power -eq 'running') 'source running again'
-Assert (-not $global:Az.disks.ContainsKey('os1-mig') -and -not $global:Az.snaps.ContainsKey('os1-snap-mig')) 'new storage deleted'
-Assert ((Get-PhaseStatus 3) -eq '' -and -not $script:State.phase3Started) 'phase 3 reset'
-
-Write-Host "`n===== PHASE 3+4 again =====" -ForegroundColor Cyan
-Say 'y'; Invoke-Phase3
-Say 'y', 'Alice'; Invoke-Phase4
-Assert ((Get-PhaseStatus 4) -eq 'PASS') 'second migration validated'
-Assert ($global:Az.vms.ContainsKey('vm1') -and $global:Az.vms['vm1'].Power -eq 'deallocated') 'old VM kept, deallocated'
-Assert ($global:Az.nics.ContainsKey('nic1') -and $global:Az.disks.ContainsKey('os1') -and $global:Az.disks.ContainsKey('data1')) 'old NIC and disks kept'
-Assert ($global:Az.snaps.ContainsKey('os1-snap-mig') -and $global:Az.snaps.ContainsKey('data1-snap-mig')) 'snapshots kept'
+# ================= RUN 5: second migration, subscription picked from the list =================
+Write-Host "`n===== RUN 5: second migration (subscription picked from the list) =====" -ForegroundColor Cyan
+$script:SubscriptionId = $null
+Say 'y', '1', 'y', '', 'ACKNOWLEDGE', 'y', ''
+Start-Migration
+Assert-NoLeftoverAnswers
+Assert ((Get-PhaseStatus 4) -eq 'PASS' -and $global:Az.vms['vm1-mig'].Power -eq 'running') 'second migration completed'
+Assert ($global:Az.nics.ContainsKey('nic1') -and $global:Az.disks.ContainsKey('os1') -and $global:Az.vms.ContainsKey('vm1')) 'old resources all still there'
 
 Write-Host "`nALL MOCK TESTS PASSED" -ForegroundColor Green
 Remove-Item $work -Recurse -Force
