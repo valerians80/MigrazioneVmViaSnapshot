@@ -178,7 +178,10 @@ $cur = (Get-CurrentVmLines -C $script:Config) -join "`n"
 $new = (Get-NewVmLines -C $script:Config) -join "`n"
 Assert ($cur -match 'vm1' -and $cur -match 'Standard_B2ms' -and $cur -match 'LUN 2' -and $cur -match 'placeholder 10.0.1.50') 'left column: current VM with placeholder'
 Assert ($new -match 'vm1-mig' -and $new -match 'Standard_B2s_v2' -and $new -match '10.0.1.10' -and $new -match 'data1-mig') 'right column: new VM'
-Assert ($new -match 'not restored \(manual\): CustomScriptExtension') 'right column: manual extension listed'
+Assert ($new -match 'Extensions     : none - install by hand') 'right column: extensions are by hand'
+Assert ($cur -match 'AzureMonitorWindowsAgent \(Succeeded\)' -and $cur -match 'BrokenAccess \(Failed\)') 'left column: extensions of the old VM, one per line, with their state'
+$extNote = ($script:Config.complications | Where-Object { $_ -like 'VM extensions:*' }) -join ''
+Assert ($extNote -match 'NONE is installed on the new VM' -and $extNote -match 'AzureMonitorWindowsAgent \[AzureMonitorWindowsAgent 1.0, Succeeded\]' -and $extNote -match 'BrokenAccess \[VMAccessForLinux 1.5, Failed\]') 'extensions listed as not handled, with type, version and state'
 Assert (($script:Config.complications -join ' | ') -match 'Azure Backup: the new VM is NOT enrolled') 'backup is always listed as not handled'
 Assert (-not ($global:Az.calls -match 'backup')) 'no backup lookup at all'
 $nicLabel = (Get-ProgressItems | Where-Object { $_.key -eq 'p3.new-nic.nic1' }).label
@@ -194,9 +197,8 @@ Assert-NoLeftoverAnswers
 Assert ($global:Az.vms['vm1-mig'].Power -eq 'running') 'replacement VM created after resume'
 Assert ((Get-PhaseStatus 3) -eq 'done') 'deployment done'
 Assert ((Get-PhaseStatus 4) -eq 'PASS') 'automatic checks PASS'
-Assert ($global:ExtAdded -contains 'AzureMonitorWindowsAgent' -and $global:ExtAdded -notcontains 'CustomScriptExtension') 'extensions: restored vs manual'
-Assert ($global:ExtAdded -notcontains 'BrokenAccess') 'an extension that was Failed on the source is not restored'
-Assert (($script:Config.complications -join ' | ') -match "Extension 'BrokenAccess'.*state 'Failed' on the source") 'a Failed source extension is listed as not handled'
+Assert ($global:ExtAdded.Count -eq 0) 'no extension is ever installed by the script'
+Assert (-not ((Get-ProgressItems | ForEach-Object { $_.key }) -match 'extension')) 'no extension step in the progress list'
 Assert ($global:RoleAdded.Count -eq 0) 'no role assignments touched'
 Assert (@($global:Az.calls | ? { $_ -like 'rest PUT' -or $_ -like 'rest DELETE' -or $_ -like 'lock*' -or $_ -like 'role*' }).Count -eq 0) 'no DCR write, lock or role calls'
 Assert ($global:Az.nics['nic1-mig'].IpConfigurations[0].LoadBalancerBackendAddressPools.Count -eq 0) 'new NIC not added to LB pool (flagged only)'

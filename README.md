@@ -24,7 +24,7 @@ The script never touches the guest OS. Temp-disk remediation and every in-guest 
 .\Invoke-VmSkuMigration.ps1 -TenantId <id> -SubscriptionId <id> -VmName <vm>
 ```
 
-The size mapping and the extension skip lists are at the top of the script.
+The size mapping is at the top of the script.
 
 ### MFA (Azure refuses changes without it)
 
@@ -51,7 +51,7 @@ the automatic retry exists as well.
 3. The manual checks to be done inside the guest are listed; you confirm Y/N that they are all done.
 4. The VM is read and a two-column screen is shown, redrawn after every step: **CURRENT VM** (green, left) and
    **NEW VM** (red, right), with resource group, name, size, security type, public IP, NICs with IPs, OS disk,
-   data disks with LUN, extensions, and the power state of both machines.
+   data disks with LUN, extensions (with their state), and the power state of both machines.
 5. You choose the new size from the playbook list. Each size is checked against the subscription (region, zone,
    quota, Hyper-V generation, no reduction of vCPU/memory).
 6. For every IP configuration the first free address of its subnet is taken as placeholder for the old NIC;
@@ -59,7 +59,7 @@ the automatic retry exists as well.
 7. The plan is shown (old VM with the placeholder IPs, new VM with everything that will be applied) together
    with what the script does **not** handle. You type `ACKNOWLEDGE`, then confirm Y/N to deploy.
 8. Deployment, with a progress list: shut down the old VM, snapshots, new disks, old NIC moved to the placeholder,
-   new NIC with the original IP, new VM, extensions.
+   new NIC with the original IP (and the public IP), new VM.
 9. Automatic checks compare the new VM with the recorded configuration (`validation-report.csv`), then the
    tests to do are listed with a reminder to **keep the old VM switched off**.
 
@@ -76,18 +76,19 @@ run the script from the same folder to find them again.
 
 VM (target size, zone, security type, Hyper-V generation, license type / Hybrid Benefit, tags, marketplace plan),
 OS and data disks (same SKU, size, zone, LUN, caching), NIC(s) with the original private IP as static, NSG,
-application security groups, accelerated networking, custom DNS servers, the original public IP, and the VM
-extensions that do not need protected settings.
+application security groups, accelerated networking, custom DNS servers and the original public IP.
 
 ## What it only reports (to be done by hand)
 
-Managed identities (system and user-assigned, with their role assignments and Key Vault policies), load balancer /
+**VM extensions** (name, type, version and state of each one on the old VM are listed: none is installed on the new VM),
+managed identities (system and user-assigned, with their role assignments and Key Vault policies), load balancer /
 application gateway pools and NAT rules, availability set and proximity placement group, resource locks, data
-collection rule associations, capacity reservation, extensions with protected settings.
+collection rule associations, capacity reservation.
 They are listed before the start and you must type `ACKNOWLEDGE`.
 
-**Backup is never detected or touched.** It is stated on the first screen, in the manual checks and in the list above:
-the new VM is not enrolled in backup and you enable it by hand after validation.
+**Backup and extensions are never detected, restored or touched.** They are stated on the first screen, in the manual
+checks and in the list above: the new VM is not enrolled in backup and has no extensions; you do both by hand after
+validation.
 
 The VM is not migrated at all (the script stops and says why) when: no target size is usable in the subscription,
 the VM has Azure Disk Encryption, an ephemeral / shared / Ultra / PremiumV2 disk, is a scale-set member, has an
@@ -95,8 +96,8 @@ IPv6 configuration or no free placeholder IP exists.
 
 ## After a successful migration (manual)
 
-After the owner's formal sign-off: remove the old VM, NIC, disks and snapshots (default retention 14 days), and
-enable backup on the new VM once the old backup item is dealt with.
+Install the extensions on the new VM, then after the owner's formal sign-off: remove the old VM, NIC, disks and
+snapshots (default retention 14 days), and enable backup on the new VM once the old backup item is dealt with.
 
 ## Safety rules enforced by the script
 
@@ -106,8 +107,7 @@ enable backup on the new VM once the old backup item is dealt with.
 
 ## Known limits
 
-- Extensions with protected settings (custom script, domain join, MMA/OMS, DSC) cannot be read back: they are reported.
-- The replacement VM uses managed boot diagnostics.
+- The replacement VM uses managed boot diagnostics; the screenshot is looked at in the portal (it often cannot be downloaded by script).
 - The security type of the new OS disk is inherited from the snapshot (it cannot be set when copying); the script warns if it differs.
 - Rollback deletes the new VM/NICs; it does not offer a "park the new NIC on a placeholder" variant.
 

@@ -113,3 +113,8 @@ il nuovo script li riconosce (entrambi i nomi) quando si esegue il rollback.
 **Backup (decisione del 06/10/2026):** il backup non viene più rilevato né toccato. Compare sempre come avviso fisso:
 nella prima schermata, nei check manuali e nell'elenco "non gestito" (la nuova VM non è iscritta al backup; si abilita a mano dopo la validazione).
 Eliminato il controllo con `Az.RecoveryServices` (e l'errore `Backup status lookup failed`).
+
+**Estensioni (decisione del 06/10/2026):** le estensioni VM non vengono più ripristinate: si gestiscono a mano, come il backup.
+Lo script le registra (nome, tipo, versione, stato sulla VM vecchia), le mostra nella colonna sinistra e nell'elenco "non gestito"
+(la nuova VM non ne ha nessuna), e lo dice nella prima schermata. Tolti: il passo di ripristino, i controlli sulle estensioni nella
+validazione e le liste `ExtensionsToSkip` / `ExtensionsManual`.

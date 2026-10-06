@@ -16,15 +16,16 @@
       5. asks for the new size (the playbook list, checked against the subscription: region, zone, quota)
       6. takes the first free IP of the subnet as placeholder for the old NIC(s); the new NIC(s) get the original IP
       7. shows the full plan and what is NOT handled, asks to acknowledge it, then Y/N to deploy
-      8. deploys: shut down the old VM, snapshots, new disks, IP hand-over, new NIC/VM, extensions
+      8. deploys: shut down the old VM, snapshots, new disks, IP hand-over, new NIC/VM
       9. runs automatic checks and reminds the tests to do, keeping the old VM switched off
 
     Running the script again on a VM that already has a migration offers: resume, run the checks again, or roll back.
 
     SCOPE: plain VM recreation only. The replacement VM is created next to the source with the suffix "-mig"
-    (VM, NICs, disks). Everything the script does NOT handle (managed identity, load balancer / application gateway
-    pools, availability set, backup, locks, monitoring rule associations, ...) is detected, listed and must be
-    acknowledged before the start; those items are done by hand.
+    (VM, NICs, disks). Everything the script does NOT handle (VM extensions, backup, managed identity, load balancer /
+    application gateway pools, availability set, locks, monitoring rule associations, ...) is detected, listed and
+    must be acknowledged before the start; those items are done by hand. Backup and extensions are stated on the
+    very first screen.
 
     NOTHING of the source is ever deleted. The source VM, its NIC and its disks stay in place, deallocated, and its
     NIC is parked on a placeholder IP. Rollback is a reversal. Removing the old VM, disks and snapshots, and
@@ -94,14 +95,6 @@ $script:SkuMap = @{
     'Standard_F4s_v2' = 'Standard_D4ls_v6'
     'Standard_F8s_v2' = 'Standard_D8ls_v6'
 }
-
-# Extension types that are re-created by the platform / backup service and must not be restored by hand.
-$script:ExtensionsToSkip = @('VMSnapshot', 'VMSnapshotLinux', 'RestorePoint*')
-
-# Extension types whose protected settings (keys, passwords) cannot be read back from Azure.
-# They are reported and must be re-applied manually.
-$script:ExtensionsManual = @('CustomScriptExtension', 'CustomScript', 'JsonADDomainExtension',
-    'MicrosoftMonitoringAgent', 'OmsAgentForLinux', 'DSC', 'Microsoft.Powershell.DSC')
 
 # ======================================================================================================
 # SCRIPT STATE
@@ -693,28 +686,20 @@ function Invoke-Capture {
 
     # ---- extensions ----
     $extRecords = @()
+    # Extensions are never installed by the script: they are only recorded, so the operator knows what to reinstall by hand.
     foreach ($e in @(Get-AzVMExtension -ResourceGroupName $rg -VMName $vm.Name)) {
         if ($e.ExtensionType -like 'AzureDiskEncryption*') { $blockers += "Azure Disk Encryption extension '$($e.Name)' present: handle this VM separately." }
-        $skip = [bool]($script:ExtensionsToSkip | Where-Object { $e.ExtensionType -like $_ })
-        $manual = [bool]($script:ExtensionsManual | Where-Object { $e.ExtensionType -like $_ })
-        if ($manual) { $complications += "Extension '$($e.Name)' ($($e.ExtensionType)) has protected settings that cannot be read: re-apply it manually." }
-        # An extension that is not healthy on the source would only fail again on the new VM: report it, do not restore it.
-        $extState = [string]$e.ProvisioningState
-        if ($extState -and $extState -ne 'Succeeded' -and -not $skip -and -not $manual) {
-            $skip = $true
-            $complications += "Extension '$($e.Name)' ($($e.ExtensionType)) is in state '$extState' on the source: it is NOT restored. Fix it on the source, or install it by hand on the new VM."
-        }
         $extRecords += [ordered]@{
-            name                   = $e.Name
-            publisher              = $e.Publisher
-            type                   = $e.ExtensionType
-            version                = $e.TypeHandlerVersion
-            settings               = [string]$e.PublicSettings
-            autoUpgradeMinor       = [bool]$e.AutoUpgradeMinorVersion
-            enableAutomaticUpgrade = [bool]$e.EnableAutomaticUpgrade
-            skip                   = $skip
-            manual                 = $manual
+            name      = $e.Name
+            publisher = $e.Publisher
+            type      = $e.ExtensionType
+            version   = $e.TypeHandlerVersion
+            state     = [string]$e.ProvisioningState
         }
+    }
+    if ($extRecords.Count) {
+        $list = ($extRecords | ForEach-Object { "$($_.name) [$($_.type) $($_.version), $($_.state)]" }) -join '; '
+        $complications += "VM extensions: NONE is installed on the new VM. Install them by hand (settings and keys included). On the old VM: $list"
     }
 
     # ---- things the script does not handle (detected for the operator) ----
@@ -1132,29 +1117,9 @@ function Invoke-Execute {
         Write-Log "Replacement VM created: $($nv.Id)" 'OK'
     }
 
-    # --- extensions ---------------------------------------------------------------------------------------
-    foreach ($e in $c.extensions) {
-        if ($e.skip) { continue }
-        if ($e.manual) { Write-Log "Extension '$($e.name)' needs manual re-application (protected settings)." 'WARN'; continue }
-        Invoke-Step "p3.extension.$($e.name)" -NonFatal {
-            $ep = @{
-                ResourceGroupName = $rg; VMName = $newVmName; Location = $c.location; Name = $e.name
-                Publisher = $e.publisher; ExtensionType = $e.type; TypeHandlerVersion = $e.version
-            }
-            if ($e.settings) { $ep.SettingString = $e.settings }
-            if (-not $e.autoUpgradeMinor) { $ep.DisableAutoUpgradeMinorVersion = $true }
-            if ($e.enableAutomaticUpgrade) { $ep.EnableAutomaticUpgrade = $true }
-            $r = Set-AzVMExtension @ep
-            if ($r -and ($r.PSObject.Properties.Name -contains 'IsSuccessStatusCode') -and -not $r.IsSuccessStatusCode) { throw "Set-AzVMExtension: $($r.ReasonPhrase)" }
-        }
-    }
-
-    $failed = @($st.warnings)
-    Set-PhaseResult 3 $(if ($failed.Count) { 'done-with-warnings' } else { 'done' })
+    # Extensions, backup, identity, load balancer pools... are NOT handled: they are listed for the operator.
+    Set-PhaseResult 3 'done'
     Write-Log "Deployment complete. Replacement VM $newVmName is running; source VM $($c.vmName) stays deallocated." 'OK'
-    foreach ($w in $failed) { Write-Log "Needs attention: $w (re-run phase 3 to retry failed extension steps)" 'WARN' }
-    if ($c.complications.Count) {
-    }
 }
 
 # ======================================================================================================
@@ -1240,15 +1205,7 @@ function Invoke-Validate {
         }
     }
 
-    # ---- platform: extensions, identity, locks, monitoring, backup ----
-    $nvExt = @(Get-AzVMExtension -ResourceGroupName $rg -VMName $newName)
-    foreach ($e in $c.extensions) {
-        if ($e.skip) { continue }
-        $found = $nvExt | Where-Object { $_.Name -eq $e.name } | Select-Object -First 1
-        if ($e.manual) { Add-Check 'Extension' $e.name 'manual re-apply' $(if ($found) { $found.ProvisioningState } else { 'absent' }) $(if ($found -and $found.ProvisioningState -eq 'Succeeded') { 'PASS' } else { 'WARN' }); continue }
-        if (-not $found) { Add-Check 'Extension' $e.name 'Succeeded' 'absent' 'FAIL' }
-        else { Add-EqCheck 'Extension' $e.name 'Succeeded' $found.ProvisioningState }
-    }
+    # ---- not handled by the script: listed, never checked ----
     foreach ($x in $c.complications) { Add-Check 'Manual follow-up' $x 'done by hand' 'not checked by script' 'INFO' }
 
     # boot diagnostics screenshot, for a human to look at
@@ -1262,8 +1219,6 @@ function Invoke-Validate {
         $why = ($_.Exception.Message -replace '\s+', ' ').Trim()
         Add-Check 'VM' 'Boot diagnostics screenshot' 'look at it in the portal (VM > Boot diagnostics)' "not downloadable: $why" 'INFO'
     }
-
-    foreach ($w in @($script:State.warnings)) { Add-Check 'Phase 3' 'Restore step' 'completed' $w 'FAIL' }
 
     # ---- report ----
     $script:Checks | Export-Csv -Path $script:Paths.Report -NoTypeInformation -Encoding utf8
@@ -1450,7 +1405,11 @@ function Get-CurrentVmLines {
         foreach ($d in ($C.dataDisks | Sort-Object { [int]$_.lun })) { $lines += "  LUN $($d.lun)  $($d.name) ($($d.sizeGB) GB)" }
     }
     else { $lines += 'Data disks     : none' }
-    $lines += "Extensions     : $(if ($C.extensions.Count) { ($C.extensions | ForEach-Object { $_.name }) -join ', ' } else { 'none' })"
+    if ($C.extensions.Count) {
+        $lines += 'Extensions     :'
+        foreach ($e in $C.extensions) { $lines += "  $($e.name) ($($e.state))" }
+    }
+    else { $lines += 'Extensions     : none' }
     return $lines
 }
 
@@ -1474,10 +1433,7 @@ function Get-NewVmLines {
         foreach ($d in ($C.dataDisks | Sort-Object { [int]$_.lun })) { $lines += "  LUN $($d.lun)  $(Get-TargetName $d.name) ($($d.sizeGB) GB)" }
     }
     else { $lines += 'Data disks     : none' }
-    $restored = @($C.extensions | Where-Object { -not $_.skip -and -not $_.manual } | ForEach-Object { $_.name })
-    $manual = @($C.extensions | Where-Object { $_.manual } | ForEach-Object { $_.name })
-    $lines += "Extensions     : $(if ($restored) { $restored -join ', ' } else { 'none' })"
-    if ($manual) { $lines += "  not restored (manual): $($manual -join ', ')" }
+    $lines += "Extensions     : $(if ($C.extensions.Count) { 'none - install by hand' } else { 'none' })"
     return $lines
 }
 
@@ -1501,10 +1457,6 @@ function Get-ProgressItems {
         $items += @{ key = "p3.new-nic.$($n.name)"; label = $label }
     }
     $items += @{ key = 'p3.new-vm'; label = "Create VM $(Get-TargetName $c.vmName -MaxLength 64)" }
-    foreach ($e in $c.extensions) {
-        if ($e.skip -or $e.manual) { continue }
-        $items += @{ key = "p3.extension.$($e.name)"; label = "Restore extension $($e.name)" }
-    }
     return $items
 }
 
@@ -1562,6 +1514,7 @@ function Show-Intro {
     Write-Host '    it lists them before the start and you do them by hand'
     Write-Host ''
     Write-Host 'BACKUP: the script never touches Azure Backup. The new VM is NOT enrolled: enable backup by hand after validation.' -ForegroundColor Yellow
+    Write-Host 'EXTENSIONS: the script never installs VM extensions. The new VM has none: install them by hand (the old VM''s list is shown).' -ForegroundColor Yellow
     Write-Host ''
 }
 
@@ -1578,6 +1531,7 @@ function Confirm-ManualChecks {
         'DNS, firewall and allow-list dependencies listed, so they can be reverted in case of rollback'
         'Drive letters / mount points recorded (the script records disks and LUNs, not drive letters)'
         'Backup: the script does not touch it and the NEW VM will NOT be protected: enable it by hand after validation'
+        'Extensions: the script does not install them: note the extensions of the VM (settings and keys included) to reinstall them on the new VM'
     ) | ForEach-Object { Write-Host "  [ ] $_" }
     Write-Host ''
     return (Confirm-Action 'Have ALL the checks above been completed?')
