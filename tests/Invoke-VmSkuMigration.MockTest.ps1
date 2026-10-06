@@ -172,6 +172,10 @@ $new = (Get-NewVmLines -C $script:Config) -join "`n"
 Assert ($cur -match 'vm1' -and $cur -match 'Standard_B2ms' -and $cur -match 'LUN 2' -and $cur -match 'placeholder 10.0.1.50') 'left column: current VM with placeholder'
 Assert ($new -match 'vm1-mig' -and $new -match 'Standard_B2s_v2' -and $new -match '10.0.1.10' -and $new -match 'data1-mig') 'right column: new VM'
 Assert ($new -match 'not restored \(manual\): CustomScriptExtension') 'right column: manual extension listed'
+$nicLabel = (Get-ProgressItems | Where-Object { $_.key -eq 'p3.new-nic.nic1' }).label
+Assert ($nicLabel -match '10.0.1.10' -and $nicLabel -match 'attach the public IP 20.1.1.1') 'progress says the public IP is attached to the new NIC'
+Assert ($cur -match '-> placeholder 10.0.1.50') 'placeholder shown on its own line'
+Assert (($script:Notices -join ' ') -notmatch "`n") 'notices are single-line'
 
 # ================= RUN 2: resume =================
 Write-Host "`n===== RUN 2: resume =====" -ForegroundColor Cyan

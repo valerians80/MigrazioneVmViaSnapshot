@@ -520,8 +520,9 @@ function Get-VmBackupInfo {
         return @{ moduleAvailable = $true; protected = $true; vaultName = (Split-ResourceId $st.VaultId).Name }
     }
     catch {
-        Write-Log "Backup status lookup failed: $($_.Exception.Message)" 'WARN'
-        return @{ moduleAvailable = $true; protected = $false; lookupError = $_.Exception.Message }
+        $why = ($_.Exception.Message -replace '\s+', ' ').Trim()
+        Write-Log "Backup status lookup failed: $why" 'WARN'
+        return @{ moduleAvailable = $true; protected = $false; lookupError = $why }
     }
 }
 
@@ -720,6 +721,7 @@ function Invoke-Capture {
     $backup = Get-VmBackupInfo -Rg $rg -Name $vm.Name
     if ($backup.protected) { $complications += "Azure Backup (vault '$($backup.vaultName)'): the new VM is NOT protected. Enable backup by hand after validation, once the old VM and its backup item are dealt with." }
     elseif (-not $backup.moduleAvailable) { $complications += 'Backup protection could not be checked (Az.RecoveryServices not installed): verify manually.' }
+    elseif ($backup.lookupError) { $complications += "Backup protection could not be checked ($($backup.lookupError)): verify manually. The new VM is NOT enrolled in backup either way." }
 
     # ---- write the record ----
     $bootDiag = $vm.DiagnosticsProfile.BootDiagnostics
@@ -1399,12 +1401,13 @@ function Get-CurrentVmLines {
     $lines += "Size           : $($C.sourceSku)"
     $lines += "Security type  : $(if ($C.securityType) { $C.securityType } else { 'Standard (none)' })"
     $pips = @($C.nics | ForEach-Object { $_.ipConfigs } | Where-Object { $_.publicIp } | ForEach-Object { "$($_.publicIp.address) ($($_.publicIp.name))" })
-    $lines += "Public IP      : $(if ($pips) { ($pips -join ', ') + $(if ($moved) { ' - moved to the new VM' } else { '' }) } else { 'none' })"
+    $lines += "Public IP      : $(if ($pips) { ($pips -join ', ') + $(if ($moved) { ' - moved to new VM' } else { '' }) } else { 'none' })"
     $lines += "NICs           : $($C.nics.Count)"
     foreach ($n in $C.nics) {
         foreach ($i in $n.ipConfigs) {
             $ph = $script:State.placeholders["$($n.name)|$($i.name)"]
-            $lines += "  $($n.name): $($i.privateIp) ($($i.allocation))$(if ($ph) { ' -> placeholder ' + $ph })"
+            $lines += "  $($n.name): $($i.privateIp) ($($i.allocation))"
+            if ($ph) { $lines += "      -> placeholder $ph" }
         }
     }
     $lines += "OS disk        : $($C.osDisk.name)"
@@ -1426,7 +1429,7 @@ function Get-NewVmLines {
     $lines += "Size           : $($C.targetSku) ($($C.skuFit))"
     $lines += "Security type  : $(if ($C.securityType) { $C.securityType } else { 'Standard (none)' }) (same)"
     $pips = @($C.nics | ForEach-Object { $_.ipConfigs } | Where-Object { $_.publicIp } | ForEach-Object { "$($_.publicIp.address) ($($_.publicIp.name))" })
-    $lines += "Public IP      : $(if ($pips) { ($pips -join ', ') + ' - taken from the old VM' } else { 'none' })"
+    $lines += "Public IP      : $(if ($pips) { ($pips -join ', ') + ' - from the old VM' } else { 'none' })"
     $lines += "NICs           : $($C.nics.Count)"
     foreach ($n in $C.nics) {
         foreach ($i in $n.ipConfigs) { $lines += "  $(Get-TargetName $n.name): $($i.privateIp) (static, original IP)" }
@@ -1456,7 +1459,13 @@ function Get-ProgressItems {
         $items += @{ key = "p3.disk.$($d.name)"; label = "Create disk $(Get-TargetName $d.name) ($tag)" }
     }
     foreach ($n in $c.nics) { $items += @{ key = "p3.park-source-nic.$($n.name)"; label = "Move old NIC $($n.name) to its placeholder IP, detach the public IP" } }
-    foreach ($n in $c.nics) { $items += @{ key = "p3.new-nic.$($n.name)"; label = "Create NIC $(Get-TargetName $n.name) with the original IP" } }
+    foreach ($n in $c.nics) {
+        $ips = @($n.ipConfigs | ForEach-Object { $_.privateIp }) -join ', '
+        $pubs = @($n.ipConfigs | Where-Object { $_.publicIp } | ForEach-Object { $_.publicIp.address }) -join ', '
+        $label = "Create NIC $(Get-TargetName $n.name) with the original IP $ips"
+        if ($pubs) { $label += " and attach the public IP $pubs" }
+        $items += @{ key = "p3.new-nic.$($n.name)"; label = $label }
+    }
     $items += @{ key = 'p3.new-vm'; label = "Create VM $(Get-TargetName $c.vmName -MaxLength 64)" }
     foreach ($e in $c.extensions) {
         if ($e.skip -or $e.manual) { continue }
@@ -1488,7 +1497,12 @@ function Show-Screen {
     if ($Progress) { Show-Progress }
     if ($script:Notices.Count) {
         Write-Host ''
-        foreach ($n in $script:Notices) { Write-Host "  ! $n" -ForegroundColor Yellow }
+        $max = (Get-ScreenWidth) - 6
+        foreach ($n in $script:Notices) {
+            $one = ($n -replace '\s+', ' ').Trim()
+            if ($one.Length -gt $max) { $one = $one.Substring(0, $max - 3) + '...' }
+            Write-Host "  ! $one" -ForegroundColor Yellow
+        }
     }
 }
 
