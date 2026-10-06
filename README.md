@@ -35,16 +35,18 @@ Some tenants make Azure refuse any create/update/delete unless the sign-in carri
 
 - **Automatic:** if that happens during the deployment, the script signs in again with the claims Azure printed
   (a browser window opens), then retries the step that was refused. Nothing is lost: steps are checkpointed.
-- **At the start:** pass `-RequireMfa` to sign in with the MFA claim before anything else, so the MFA is done up front
-  (`-ClaimsChallenge <value>` does the same with the exact value from Azure's own message, base64 or raw JSON).
-  This forces a new sign-in instead of reusing the current session.
+- **At the start:** pass `-RequireMfa` to sign in with a fixed MFA claim (authentication context `p1`) before anything
+  else, so the MFA is done up front. **That value comes from the error message of one tenant and is not guaranteed for
+  every tenant**: in another tenant use `-ClaimsChallenge <value>` with the exact value Azure prints in its own error
+  message (base64 or raw JSON). Both force a new sign-in instead of reusing the current session.
 
 ```powershell
 .\Invoke-VmSkuMigration.ps1 -RequireMfa
 ```
 
 The script cannot know in advance whether a tenant enforces it (the only proof is a refused change), which is why
-the automatic retry exists as well.
+the automatic retry exists as well. The automatic retry is the tenant-independent mechanism: it uses the claims Azure
+prints in that very error.
 
 ## The guided flow
 

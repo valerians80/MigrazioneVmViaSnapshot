@@ -49,9 +49,11 @@
 .PARAMETER Suffix
     Suffix appended to the names of everything the script creates. Default: -mig
 .PARAMETER RequireMfa
-    Signs in at the very start with the claims challenge that Azure's mandatory-MFA enforcement asks for
-    (authentication context "p1"), so the MFA is done before any change. Without it the script signs in normally
-    and, if Azure refuses a change because MFA is missing, it signs in again by itself and retries the step.
+    Signs in at the very start with a fixed claims challenge (authentication context "p1"), so the MFA is done before
+    any change. That value was taken from the error message of ONE tenant: it is not guaranteed to be valid in every
+    tenant. In another tenant use -ClaimsChallenge with the value Azure prints there. Without either switch the script
+    signs in normally and, if Azure refuses a change because MFA is missing, it signs in again by itself, with the
+    claims Azure printed in that very error (valid for any tenant), and retries the step.
 .PARAMETER ClaimsChallenge
     Same as -RequireMfa but with the value that Azure printed in its own error message (base64 string, or the raw JSON).
 
@@ -74,7 +76,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# Claims challenge used by Azure's mandatory-MFA enforcement: {"access_token":{"acrs":{"essential":true,"values":["p1"]}}}
+# Claims challenge used by -RequireMfa: {"access_token":{"acrs":{"essential":true,"values":["p1"]}}}
+# It comes from the error message of one tenant; other tenants may ask for a different value (use -ClaimsChallenge there).
 $script:MfaClaims = 'eyJhY2Nlc3NfdG9rZW4iOnsiYWNycyI6eyJlc3NlbnRpYWwiOnRydWUsInZhbHVlcyI6WyJwMSJdfX19'
 
 # ======================================================================================================
