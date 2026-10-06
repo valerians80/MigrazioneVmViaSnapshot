@@ -50,7 +50,6 @@
 
 .NOTES
     Required modules : Az.Accounts, Az.Compute, Az.Network, Az.Resources
-    Optional modules : Az.RecoveryServices (only used to detect whether the VM is backed up)
     Required rights  : Contributor on the VM / network / disk resource groups.
     Window width     : two columns need about 110 characters; narrower windows stack the two blocks.
 #>
@@ -386,9 +385,6 @@ function Test-Prerequisites {
     foreach ($m in 'Az.Accounts', 'Az.Compute', 'Az.Network', 'Az.Resources') {
         if (-not (Get-Module -ListAvailable -Name $m)) { throw "Required module '$m' is not installed (Install-Module Az)." }
     }
-    if (-not (Get-Module -ListAvailable -Name 'Az.RecoveryServices')) {
-        Write-Log "Optional module 'Az.RecoveryServices' is not installed: backup protection cannot be detected, check it manually." 'WARN'
-    }
 }
 
 function Connect-Target {
@@ -506,24 +502,6 @@ function Test-TargetSku {
     }
     catch { Write-Log "Could not read vCPU quota: $($_.Exception.Message)" 'WARN' }
     return $problems
-}
-
-function Get-VmBackupInfo {
-    # Detection only: the script never enrols or removes backup protection.
-    param([Parameter(Mandatory)][string]$Rg, [Parameter(Mandatory)][string]$Name)
-    if (-not (Get-Command Get-AzRecoveryServicesBackupStatus -ErrorAction SilentlyContinue)) {
-        return @{ moduleAvailable = $false; protected = $false }
-    }
-    try {
-        $st = Get-AzRecoveryServicesBackupStatus -Name $Name -ResourceGroupName $Rg -Type AzureVM
-        if (-not $st.BackedUp) { return @{ moduleAvailable = $true; protected = $false } }
-        return @{ moduleAvailable = $true; protected = $true; vaultName = (Split-ResourceId $st.VaultId).Name }
-    }
-    catch {
-        $why = ($_.Exception.Message -replace '\s+', ' ').Trim()
-        Write-Log "Backup status lookup failed: $why" 'WARN'
-        return @{ moduleAvailable = $true; protected = $false; lookupError = $why }
-    }
 }
 
 function Get-DcrAssociations {
@@ -718,10 +696,8 @@ function Invoke-Capture {
     }
     catch { $warnings += "Could not read resource locks: $($_.Exception.Message)" }
 
-    $backup = Get-VmBackupInfo -Rg $rg -Name $vm.Name
-    if ($backup.protected) { $complications += "Azure Backup (vault '$($backup.vaultName)'): the new VM is NOT protected. Enable backup by hand after validation, once the old VM and its backup item are dealt with." }
-    elseif (-not $backup.moduleAvailable) { $complications += 'Backup protection could not be checked (Az.RecoveryServices not installed): verify manually.' }
-    elseif ($backup.lookupError) { $complications += "Backup protection could not be checked ($($backup.lookupError)): verify manually. The new VM is NOT enrolled in backup either way." }
+    # Backup is never detected nor handled: it is always on the list, so it is shown from the very start.
+    $complications += 'Azure Backup: the new VM is NOT enrolled in backup. Enable it by hand after validation, once the old VM and its backup item are dealt with.'
 
     # ---- write the record ----
     $bootDiag = $vm.DiagnosticsProfile.BootDiagnostics
@@ -756,7 +732,6 @@ function Invoke-Capture {
         extensions                = $extRecords
         dcrAssociations           = $dcr
         locks                     = $vmLocks
-        backup                    = $backup
         complications             = $complications
         warnings                  = $warnings
     }
@@ -1524,8 +1499,10 @@ function Show-Intro {
     Write-Host 'What it does not do:'
     Write-Host '  - it never looks inside the guest operating system (those checks are yours)'
     Write-Host '  - it never deletes the old VM, its NIC, disks or snapshots'
-    Write-Host '  - it does not move identity, load balancer membership, availability set, backup or locks:'
+    Write-Host '  - it does not move identity, load balancer membership, availability set or locks:'
     Write-Host '    it lists them before the start and you do them by hand'
+    Write-Host ''
+    Write-Host 'BACKUP: the script never touches Azure Backup. The new VM is NOT enrolled: enable backup by hand after validation.' -ForegroundColor Yellow
     Write-Host ''
 }
 
@@ -1541,7 +1518,7 @@ function Confirm-ManualChecks {
         'Application owners informed, change window agreed'
         'DNS, firewall and allow-list dependencies listed, so they can be reverted in case of rollback'
         'Drive letters / mount points recorded (the script records disks and LUNs, not drive letters)'
-        'Backup situation known (the script does not touch backup)'
+        'Backup: the script does not touch it and the NEW VM will NOT be protected: enable it by hand after validation'
     ) | ForEach-Object { Write-Host "  [ ] $_" }
     Write-Host ''
     return (Confirm-Action 'Have ALL the checks above been completed?')

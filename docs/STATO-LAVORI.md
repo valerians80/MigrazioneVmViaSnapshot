@@ -109,3 +109,7 @@ Non ancora provato su Azure reale dopo la riscrittura: **il prossimo test reale 
 
 Nota per il test già in corso: la migrazione di `vmmigtest01` fatta con la versione precedente ha snapshot con il nome vecchio;
 il nuovo script li riconosce (entrambi i nomi) quando si esegue il rollback.
+
+**Backup (decisione del 06/10/2026):** il backup non viene più rilevato né toccato. Compare sempre come avviso fisso:
+nella prima schermata, nei check manuali e nell'elenco "non gestito" (la nuova VM non è iscritta al backup; si abilita a mano dopo la validazione).
+Eliminato il controllo con `Az.RecoveryServices` (e l'errore `Backup status lookup failed`).

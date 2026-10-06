@@ -14,7 +14,6 @@ The script never touches the guest OS. Temp-disk remediation and every in-guest 
 
 - PowerShell 7+
 - `Az.Accounts`, `Az.Compute`, `Az.Network`, `Az.Resources`
-- Optional: `Az.RecoveryServices` (only to detect whether the VM is backed up)
 - Contributor on the VM / network / disk resource groups
 
 ## Usage
@@ -65,9 +64,12 @@ extensions that do not need protected settings.
 ## What it only reports (to be done by hand)
 
 Managed identities (system and user-assigned, with their role assignments and Key Vault policies), load balancer /
-application gateway pools and NAT rules, availability set and proximity placement group, Azure Backup, resource
-locks, data collection rule associations, capacity reservation, extensions with protected settings.
+application gateway pools and NAT rules, availability set and proximity placement group, resource locks, data
+collection rule associations, capacity reservation, extensions with protected settings.
 They are listed before the start and you must type `ACKNOWLEDGE`.
+
+**Backup is never detected or touched.** It is stated on the first screen, in the manual checks and in the list above:
+the new VM is not enrolled in backup and you enable it by hand after validation.
 
 The VM is not migrated at all (the script stops and says why) when: no target size is usable in the subscription,
 the VM has Azure Disk Encryption, an ephemeral / shared / Ultra / PremiumV2 disk, is a scale-set member, has an
