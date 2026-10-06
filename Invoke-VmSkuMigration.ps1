@@ -1238,7 +1238,7 @@ function Invoke-Rollback {
     $script:OnStepChanged = $null
     Write-Log 'Rollback (modifies Azure resources)' 'STEP'
     $st = $script:State
-    if (-not $st.phase3Started) { Write-Log 'Nothing to roll back: phase 3 never started.' 'WARN'; return }
+    if (-not $st.phase3Started) { Write-Log 'Nothing to roll back: the deployment never started.' 'WARN'; return }
     $c = $script:Config
     $rg = $c.resourceGroup
     $newName = Get-TargetName $c.vmName -MaxLength 64
@@ -1282,7 +1282,7 @@ function Invoke-Rollback {
         Wait-VmPowerState -Rg $rg -Name $c.vmName -State 'running'
     }
 
-    if (Confirm-Action 'Also delete the new disks and snapshots created by phase 3 (needed to retry the migration with the same names)?') {
+    if (Confirm-Action 'Also delete the new disks and snapshots created by the deployment (needed to retry the migration with the same names)?') {
         Invoke-Step 'rb.delete-new-storage' -NonFatal {
             foreach ($d in @($c.osDisk) + @($c.dataDisks)) {
                 $dn = Get-TargetName $d.name
@@ -1313,7 +1313,7 @@ function Invoke-Rollback {
     $st.warnings = @()
     foreach ($k in '3', '4') { $st.phases.Remove($k) }
     Save-State
-    Write-Log 'Rollback complete. Phases 3 and 4 were reset; the failure reason is in state.json history.' 'OK'
+    Write-Log 'Rollback complete. The deployment state was reset; the failure reason is in state.json (history). Run the script again to start a new migration.' 'OK'
 }
 
 # ======================================================================================================
