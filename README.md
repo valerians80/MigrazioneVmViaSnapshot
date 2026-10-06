@@ -68,7 +68,7 @@ prints in that very error.
    tests to do are listed with a reminder to **keep the old VM switched off**.
 
 If the VM already has a migration, running the script again offers: resume the deployment (checkpoint per step),
-run the automatic checks again, or **roll back** (delete the new VM and NICs, give the original IP and public IP
+run the automatic checks again, or **roll back** (delete the new VM and NICs, give the original IP (as static, even if it was dynamic) and the public IP
 back to the old NIC, start the old VM).
 
 Naming: VM, NICs and disks get the suffix `-mig`; snapshots are `<disk>-snap-os-mig` (OS disk) and

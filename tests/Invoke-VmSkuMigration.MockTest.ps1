@@ -32,7 +32,7 @@ $global:Az.nics['nic1'] = O @{
     NetworkSecurityGroup = (O @{ Id = $nsgId }); EnableAcceleratedNetworking = $true; EnableIPForwarding = $false
     DnsSettings = (O @{ DnsServers = @('10.0.0.4') })
     IpConfigurations = @(O @{
-            Name = 'ipconfig1'; Primary = $true; PrivateIpAddress = '10.0.1.10'; PrivateIpAllocationMethod = 'Static'; PrivateIpAddressVersion = 'IPv4'
+            Name = 'ipconfig1'; Primary = $true; PrivateIpAddress = '10.0.1.10'; PrivateIpAllocationMethod = 'Dynamic'; PrivateIpAddressVersion = 'IPv4'
             Subnet = (O @{ Id = $subnetId }); PublicIpAddress = (O @{ Id = $pipId })
             ApplicationSecurityGroups = @(); LoadBalancerBackendAddressPools = @(O @{ Id = $poolId }); LoadBalancerInboundNatRules = @(); ApplicationGatewayBackendAddressPools = @()
         })
@@ -223,6 +223,7 @@ Start-Migration
 Assert-NoLeftoverAnswers
 Assert (-not $global:Az.vms.ContainsKey('vm1-mig') -and -not $global:Az.nics.ContainsKey('nic1-mig')) 'new VM and NIC removed'
 Assert ($global:Az.nics['nic1'].IpConfigurations[0].PrivateIpAddress -eq '10.0.1.10') 'old NIC original IP restored'
+Assert ($global:Az.nics['nic1'].IpConfigurations[0].PrivateIpAllocationMethod -eq 'Static') 'original IP restored as Static (it was Dynamic)'
 Assert ($global:Az.nics['nic1'].IpConfigurations[0].PublicIpAddress.Id -eq $pipId) 'public IP restored on the old NIC'
 Assert ($global:Az.vms['vm1'].Power -eq 'running') 'old VM running again'
 Assert (-not $global:Az.disks.ContainsKey('os1-mig') -and -not $global:Az.snaps.ContainsKey('os1-snap-os-mig')) 'new storage deleted'

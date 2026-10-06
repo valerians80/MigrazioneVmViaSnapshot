@@ -916,7 +916,7 @@ function Set-PlaceholderIps {
 
 function Set-SourceNicState {
     # Rewrites the source NIC. Mode 'park' moves it to the placeholder IP and detaches the public IP.
-    # Mode 'restore' puts the original IP and public IP back. Pools, rules and NSG/ASG are never touched.
+    # Mode 'restore' puts the original IP (always as Static, even if it was Dynamic) and public IP back. Pools, rules and NSG/ASG are never touched.
     param([Parameter(Mandatory)][ValidateSet('park', 'restore')][string]$Mode, [Parameter(Mandatory)]$NicRecord)
     $nic = Get-AzNetworkInterface -ResourceGroupName $NicRecord.resourceGroup -Name $NicRecord.name
     foreach ($ic in $nic.IpConfigurations) {
@@ -929,7 +929,7 @@ function Set-SourceNicState {
         }
         else {
             $ic.PrivateIpAddress = $rec.privateIp
-            $ic.PrivateIpAllocationMethod = $rec.allocation
+            $ic.PrivateIpAllocationMethod = 'Static'    # original IP is pinned as static even if it was Dynamic
             if ($rec.publicIpId) {
                 $pp = Split-ResourceId $rec.publicIpId
                 $ic.PublicIpAddress = Invoke-InSubscription $pp.Subscription { Get-AzPublicIpAddress -ResourceGroupName $pp.ResourceGroup -Name $pp.Name }
