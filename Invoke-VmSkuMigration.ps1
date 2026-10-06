@@ -698,6 +698,12 @@ function Invoke-Capture {
         $skip = [bool]($script:ExtensionsToSkip | Where-Object { $e.ExtensionType -like $_ })
         $manual = [bool]($script:ExtensionsManual | Where-Object { $e.ExtensionType -like $_ })
         if ($manual) { $complications += "Extension '$($e.Name)' ($($e.ExtensionType)) has protected settings that cannot be read: re-apply it manually." }
+        # An extension that is not healthy on the source would only fail again on the new VM: report it, do not restore it.
+        $extState = [string]$e.ProvisioningState
+        if ($extState -and $extState -ne 'Succeeded' -and -not $skip -and -not $manual) {
+            $skip = $true
+            $complications += "Extension '$($e.Name)' ($($e.ExtensionType)) is in state '$extState' on the source: it is NOT restored. Fix it on the source, or install it by hand on the new VM."
+        }
         $extRecords += [ordered]@{
             name                   = $e.Name
             publisher              = $e.Publisher
@@ -1252,7 +1258,10 @@ function Invoke-Validate {
         Get-AzVMBootDiagnosticsData @bd | Out-Null
         Add-Check 'VM' 'Boot diagnostics screenshot saved for review' $script:Paths.Dir 'saved' 'INFO'
     }
-    catch { Add-Check 'VM' 'Boot diagnostics screenshot' 'saved' $_.Exception.Message 'WARN' }
+    catch {
+        $why = ($_.Exception.Message -replace '\s+', ' ').Trim()
+        Add-Check 'VM' 'Boot diagnostics screenshot' 'look at it in the portal (VM > Boot diagnostics)' "not downloadable: $why" 'INFO'
+    }
 
     foreach ($w in @($script:State.warnings)) { Add-Check 'Phase 3' 'Restore step' 'completed' $w 'FAIL' }
 

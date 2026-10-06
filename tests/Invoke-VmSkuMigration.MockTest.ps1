@@ -106,7 +106,8 @@ function Test-AzPrivateIPAddressAvailability { param($ResourceGroupName, $Virtua
     O @{ Available = ($IPAddress -notin $taken); AvailableIPAddresses = @('10.0.1.50') } }
 function Get-AzVMExtension { param($ResourceGroupName, $VMName)
     @(O @{ Name = 'AzureMonitorWindowsAgent'; Publisher = 'Microsoft.Azure.Monitor'; ExtensionType = 'AzureMonitorWindowsAgent'; TypeHandlerVersion = '1.0'; PublicSettings = '{}'; AutoUpgradeMinorVersion = $true; EnableAutomaticUpgrade = $true; ProvisioningState = 'Succeeded' }
-      O @{ Name = 'CustomScriptExtension'; Publisher = 'Microsoft.Compute'; ExtensionType = 'CustomScriptExtension'; TypeHandlerVersion = '1.10'; PublicSettings = '{}'; AutoUpgradeMinorVersion = $true; EnableAutomaticUpgrade = $false; ProvisioningState = 'Succeeded' }) }
+      O @{ Name = 'CustomScriptExtension'; Publisher = 'Microsoft.Compute'; ExtensionType = 'CustomScriptExtension'; TypeHandlerVersion = '1.10'; PublicSettings = '{}'; AutoUpgradeMinorVersion = $true; EnableAutomaticUpgrade = $false; ProvisioningState = 'Succeeded' }
+      O @{ Name = 'BrokenAccess'; Publisher = 'Microsoft.OSTCExtensions'; ExtensionType = 'VMAccessForLinux'; TypeHandlerVersion = '1.5'; PublicSettings = '{}'; AutoUpgradeMinorVersion = $true; EnableAutomaticUpgrade = $false; ProvisioningState = 'Failed' }) }
 $global:ExtAdded = @()
 function Set-AzVMExtension { param($ResourceGroupName, $VMName, $Location, $Name, $Publisher, $ExtensionType, $TypeHandlerVersion, $SettingString, [switch]$DisableAutoUpgradeMinorVersion, [switch]$EnableAutomaticUpgrade) Rec "ext $Name"; $global:ExtAdded += $Name; O @{ IsSuccessStatusCode = $true } }
 function Get-AzRoleAssignment { param($ObjectId)
@@ -194,6 +195,8 @@ Assert ($global:Az.vms['vm1-mig'].Power -eq 'running') 'replacement VM created a
 Assert ((Get-PhaseStatus 3) -eq 'done') 'deployment done'
 Assert ((Get-PhaseStatus 4) -eq 'PASS') 'automatic checks PASS'
 Assert ($global:ExtAdded -contains 'AzureMonitorWindowsAgent' -and $global:ExtAdded -notcontains 'CustomScriptExtension') 'extensions: restored vs manual'
+Assert ($global:ExtAdded -notcontains 'BrokenAccess') 'an extension that was Failed on the source is not restored'
+Assert (($script:Config.complications -join ' | ') -match "Extension 'BrokenAccess'.*state 'Failed' on the source") 'a Failed source extension is listed as not handled'
 Assert ($global:RoleAdded.Count -eq 0) 'no role assignments touched'
 Assert (@($global:Az.calls | ? { $_ -like 'rest PUT' -or $_ -like 'rest DELETE' -or $_ -like 'lock*' -or $_ -like 'role*' }).Count -eq 0) 'no DCR write, lock or role calls'
 Assert ($global:Az.nics['nic1-mig'].IpConfigurations[0].LoadBalancerBackendAddressPools.Count -eq 0) 'new NIC not added to LB pool (flagged only)'
