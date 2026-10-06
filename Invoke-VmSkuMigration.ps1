@@ -1721,7 +1721,12 @@ function Start-Migration {
         Write-Host "STOPPED: $($_.Exception.Message)" -ForegroundColor Red
         if ($script:Paths) {
             Add-Content -Path $script:Paths.Log -Value $_.ScriptStackTrace
-            Write-Host "The state is saved in $($script:Paths.Dir). Fix the cause and run the script again on the same VM: you can resume or roll back." -ForegroundColor Yellow
+            if ($script:State -and $script:State.phase3Started) {
+                Write-Host "The deployment had started. The state is saved in $($script:Paths.Dir). Fix the cause and run the script again on the same VM: you can resume or roll back." -ForegroundColor Yellow
+            }
+            else {
+                Write-Host "Nothing was changed in Azure. Fix the cause and run the script again." -ForegroundColor Yellow
+            }
         }
     }
     finally { $script:UiActive = $false; $script:OnStepChanged = $null }
