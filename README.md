@@ -104,7 +104,7 @@ VM admin credentials), in one subscription and two resource groups:
 pwsh .\testenv\New-MigrationTestEnvironment.ps1                  # Windows Server 2022 Gen2, B2ms
 pwsh .\testenv\New-MigrationTestEnvironment.ps1 -WithPublicIp -WithSystemIdentity -Zone 1
 pwsh .\testenv\New-MigrationTestEnvironment.ps1 -OsType Linux
-pwsh .\testenv\New-MigrationTestEnvironment.ps1 -Generation 1    # negative test: phase 1 must block it
+pwsh .\testenv\New-MigrationTestEnvironment.ps1 -Generation 1    # negative test: the migration must refuse sizes without Gen1 support
 pwsh .\testenv\New-MigrationTestEnvironment.ps1 -VmSize Standard_F4s_v2   # Fsv2 -> Dlsv6 path
 pwsh .\testenv\New-MigrationTestEnvironment.ps1 -Destroy         # removes both resource groups
 ```

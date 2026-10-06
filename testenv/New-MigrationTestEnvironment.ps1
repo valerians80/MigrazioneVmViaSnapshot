@@ -21,7 +21,7 @@
     Size of the test VM. Default Standard_B2ms (maps to Standard_B2s_v2, an "Exact" fit).
     Use Standard_F4s_v2 to test the Fsv2 -> Dlsv6 path.
 .PARAMETER Generation
-    2 (default) or 1. A Gen1 VM is a useful negative test: Bsv2/Dlsv6 do not support Gen1, phase 1 must block it.
+    2 (default) or 1. A Gen1 VM is a useful negative test: the target sizes that do not support Gen1 (Dlsv6 for sure, Bsv2 to be verified) must show up as NOT USABLE in the size list of the migration script, and with none usable it must stop without changing anything.
 .PARAMETER Zone
     Optional availability zone (1, 2 or 3).
 .PARAMETER PrivateIp
