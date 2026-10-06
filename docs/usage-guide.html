@@ -1,0 +1,666 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VM Migration Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root{
+  --bg:#f5f6f8; --surface:#ffffff; --fg:#1b2330; --muted:#586174; --line:#d8dde5; --accent:#0a62bf; --accent-soft:#e5eefa;
+  --note-bg:#e8f0fb; --warn-bg:#fff3d3; --stop-bg:#fbe8e5; --note-fg:#0b3b7a; --warn-fg:#5e4300; --stop-fg:#8a241d;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif; --mono:"IBM Plex Mono",ui-monospace,Consolas,monospace;
+  --term-bg:#0d1117; --term-bar:#161b22; --term-fg:#d3d9e0;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#0f141a; --surface:#161d26; --fg:#e3e8ef; --muted:#9aa5b5; --line:#2a3542; --accent:#6bb0f5; --accent-soft:#16283c;
+  --note-bg:#14283f; --warn-bg:#352b12; --stop-bg:#3a1d1a; --note-fg:#a9cdf5; --warn-fg:#f0d28a; --stop-fg:#f4a8a0; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#0f141a; --surface:#161d26; --fg:#e3e8ef; --muted:#9aa5b5; --line:#2a3542; --accent:#6bb0f5; --accent-soft:#16283c;
+  --note-bg:#14283f; --warn-bg:#352b12; --stop-bg:#3a1d1a; --note-fg:#a9cdf5; --warn-fg:#f0d28a; --stop-fg:#f4a8a0; color-scheme:dark}
+body{background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:15px;line-height:1.6}
+.page{max-width:1040px;margin:0 auto;padding-inline:20px;padding-block:36px 72px;display:flex;flex-direction:column;gap:44px}
+header{display:flex;flex-direction:column;gap:10px}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent)}
+h1{font-size:32px;line-height:1.2;margin:0;font-weight:600;letter-spacing:-.01em;text-wrap:balance}
+h2{font-size:23px;margin:0 0 14px;font-weight:600;text-wrap:balance;padding-bottom:8px;border-bottom:1px solid var(--line)}
+h3{font-size:16px;margin:22px 0 8px;font-weight:600}
+p{margin:0 0 12px;max-width:78ch} ul,ol{margin:0 0 12px;padding-left:22px} li{margin-bottom:4px;max-width:80ch}
+.lead{font-size:17px;color:var(--muted);max-width:70ch}
+code{font-family:var(--mono);font-size:.88em;background:var(--accent-soft);padding:1px 5px;border-radius:4px}
+section{scroll-margin-top:16px}
+.toc{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:14px 18px}
+.toc b{font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.toc ol{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:2px 24px;margin:8px 0 0;padding-left:20px}
+.toc a{color:var(--accent);text-decoration:none} .toc a:hover{text-decoration:underline}
+.tbl{overflow-x:auto;margin:0 0 16px;border:1px solid var(--line);border-radius:8px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:14px;min-width:560px}
+th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-size:12px;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);background:var(--bg)}
+tr:last-child td{border-bottom:none} td ul{margin:0;padding-left:18px} td li{margin-bottom:2px}
+.callout{border-radius:8px;padding:11px 14px;margin:14px 0;display:flex;flex-direction:column;gap:2px}
+.callout b{font-size:12px;letter-spacing:.06em;text-transform:uppercase}
+.callout.note{background:var(--note-bg);color:var(--note-fg)} .callout.warn{background:var(--warn-bg);color:var(--warn-fg)} .callout.stop{background:var(--stop-bg);color:var(--stop-fg)}
+figure{margin:22px 0 26px;display:flex;flex-direction:column;gap:8px}
+figcaption{font-weight:600;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.fn{font-family:var(--mono);font-size:12px;font-weight:500;background:var(--accent-soft);color:var(--accent);padding:2px 8px;border-radius:4px}
+.fd{color:var(--muted);font-size:14px;max-width:84ch}
+.term{background:var(--term-bg);border-radius:8px;overflow:hidden;border:1px solid #222a35;min-width:0}
+.termbar{background:var(--term-bar);display:flex;align-items:center;gap:6px;padding:7px 12px;border-bottom:1px solid #222a35}
+.termbar i{width:10px;height:10px;border-radius:50%;background:#3b4452;display:inline-block}
+.termbar b{margin-left:8px;font:500 11px var(--mono);color:#8b95a3}
+.term pre{margin:0;padding:12px 14px;color:var(--term-fg);font:12.5px/1.38 var(--mono);overflow-x:auto;white-space:pre;tab-size:4}
+.term.plain{margin:0 0 14px} .term.plain pre{font-size:12.5px}
+.term .g{color:#5fd38d}.term .r{color:#ff7b7b}.term .c{color:#5cc8e0}.term .y{color:#f0c75a}.term .d{color:#7e8896}.term .in{color:#fff;font-weight:600}
+.cols3{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:22px}
+.chk{list-style:none;padding-left:0} .chk li{padding-left:24px;position:relative} .chk li::before{content:"\2610";position:absolute;left:0;color:var(--accent)}
+@media (max-width:600px){h1{font-size:26px}.page{padding-inline:16px}}
+</style>
+</head>
+<body>
+
+<div class="page">
+<header>
+<div class="eyebrow">Usage guide &middot; PowerShell script</div>
+<h1>Migrating an Azure VM to a new size, step by step</h1>
+<p class="lead">How the snapshot-based migration script works: every screen you will see, what it asks, what it does, what it leaves to you, how to resume interrupted work and how to go back.</p>
+</header>
+<nav class="toc" aria-label="Contents"><b>Contents</b><ol><li><a href="#overview">What it does and does not do</a></li><li><a href="#before">Before you start</a></li><li><a href="#walkthrough">The walkthrough, screen by screen</a></li><li><a href="#blocks">When the script stops before starting</a></li><li><a href="#interruptions">Interruptions, MFA and resume</a></li><li><a href="#existing">A VM already migrated: re-check and rollback</a></li><li><a href="#files">Work folder and files</a></li><li><a href="#checks">The automatic checks</a></li><li><a href="#after">After the migration</a></li><li><a href="#rules">Safety rules, the playbook and limits</a></li><li><a href="#trouble">Troubleshooting</a></li><li><a href="#checklist">Operator checklist</a></li></ol></nav>
+<section id="overview"><h2>1. What it does and does not do</h2>
+<p><code>Invoke-VmSkuMigration.ps1</code> moves <b>one Azure VM at a time</b> to a new size (for example Bv1 &rarr; Bsv2, Fsv2 &rarr; Dlsv6) by rebuilding it from snapshots,
+as described in the size conversion playbook. It works on Azure only: it <b>never goes inside the guest operating system</b> and it <b>never deletes anything</b>.</p>
+<p>In short: it shuts the VM down, snapshots every disk, creates a new VM with the <code>-mig</code> suffix that takes over the <b>same private IP</b>
+(and the public IP, if there is one), and leaves the original VM <b>switched off and untouched</b>. If something goes wrong, the rollback brings the original VM back in a few minutes.</p>
+<div class="tbl"><table class=""><thead><tr><th>The script handles</th><th>Left to you (the script lists it before it starts)</th></tr></thead><tbody><tr><td><ul><li>New VM: chosen size, zone, security type, generation, license (Hybrid Benefit), tags, marketplace plan</li><li>Disks: new disks from full snapshots, same SKU, size, zone, LUN and caching</li><li>NIC(s) with the original private IP (static), NSG, ASG, accelerated networking, DNS</li><li>Original public IP: detached from the old NIC and attached to the new one</li><li>Automatic checks on the Azure side</li><li>Rollback</li></ul></td><td><ul><li><b>Backup</b>: the new VM is not protected, you enable it by hand after validation</li><li><b>Extensions</b>: none is installed, the old VM&#39;s list is shown</li><li>Managed identities (system and user-assigned), role assignments, Key Vault policies</li><li>Load balancer, application gateway, NAT rules</li><li>Availability set and proximity placement group</li><li>Locks, DCR associations (monitoring), capacity reservation</li><li>DNS, firewall, allow-lists and every check inside the VM</li><li>Deleting the old VM, its NIC, disks and snapshots</li></ul></td></tr></tbody></table></div>
+<div class="callout warn"><b>Backup and extensions</b><div>Both are written in yellow on the <b>very first screen</b>, in the manual checks and in the "not handled" list you must acknowledge before the deployment: no surprise at the end.</div></div>
+</section>
+<section id="before"><h2>2. Before you start</h2>
+<h3>Requirements</h3>
+<ul>
+<li><b>PowerShell 7</b> (the <code>pwsh</code> command) and the modules <code>Az.Accounts</code>, <code>Az.Compute</code>, <code>Az.Network</code>, <code>Az.Resources</code>. If something is missing the script says so immediately and does nothing else.</li>
+<li><b>Permissions</b>: Contributor on the resource groups of the VM, of the network and of the disks.</li>
+<li><b>MFA</b>: if the tenant requires it for changes, see the dedicated paragraph (section 5): the script handles it.</li>
+<li><b>A wide window</b>: the two columns need about 110 characters. In a narrower window the two blocks are stacked.</li>
+<li><b>Always the same folder</b>: the script writes its state to <code>.\migration\&lt;VM name&gt;\</code> relative to the folder you launch it from. To resume or roll back, launch it again from the same folder (or with <code>-WorkRoot</code>).</li>
+</ul>
+<h3>Starting it</h3>
+<div class="term plain"><pre>.\Invoke-VmSkuMigration.ps1</pre></div>
+<p>Everything is asked on screen; the parameters are optional and only skip questions.</p>
+<div class="tbl"><table class=""><thead><tr><th>Parameter</th><th>Effect</th></tr></thead><tbody><tr><td><code>-TenantId</code></td><td>Signs in to that tenant (otherwise <code>Connect-AzAccount</code> decides)</td></tr><tr><td><code>-SubscriptionId</code></td><td>Skips the subscription list</td></tr><tr><td><code>-VmName</code></td><td>Skips the question about the VM name</td></tr><tr><td><code>-ResourceGroupName</code></td><td>Skips the VM lookup (use together with <code>-VmName</code>)</td></tr><tr><td><code>-WorkRoot</code></td><td>Folder that holds one sub-folder per VM. Default: <code>.\migration</code></td></tr><tr><td><code>-Suffix</code></td><td>Suffix of the names the script creates. Default: <code>-mig</code></td></tr><tr><td><code>-RequireMfa</code></td><td>Signs in right away with the MFA request Azure uses, before any change (forces a new sign-in)</td></tr><tr><td><code>-ClaimsChallenge</code></td><td>Same as <code>-RequireMfa</code> but with the value Azure printed in its own error message (base64 or JSON)</td></tr></tbody></table></div>
+<p>The map between current and new sizes is at the top of the script (<code>$script:SkuMap</code>) and is edited there.</p>
+</section>
+<section id="walkthrough"><h2>3. The walkthrough, screen by screen</h2>
+<p>The path is single and guided. The examples use a fictitious VM <code>srv-app01</code> (Standard_B2ms, two data disks, a public IP). Long lines wrap as they do in the console.</p>
+<h3>How to read the two-column screen</h3>
+<ul><li><b style="color:#2e9e5b">Green, on the left</b>: the current VM, with its state (<code>RUNNING</code> / <code>DEALLOCATED (off)</code>).</li>
+<li><b style="color:#d6453d">Red, on the right</b>: the new VM, with its state (<code>NOT CREATED YET</code> / <code>RUNNING</code>).</li>
+<li>Fields: resource group, name, size, security type, public IP, NICs with IPs, OS disk, data disks with LUN, extensions.</li></ul>
+<figure><figcaption><span class="fn">Screen 1</span>Start, sign-in, subscription and VM name</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="c">AZURE VM SIZE MIGRATION VIA SNAPSHOT</span>
+<span class="d">============================================================</span>
+
+What this script does, for ONE VM:
+  1. reads the configuration of the VM and lets you choose the new size
+  2. shuts the VM down and takes a snapshot of every disk
+  3. rebuilds it as &lt;name&gt;-mig on the new size, with the same IP address
+  4. checks the result and leaves the ORIGINAL VM switched off and untouched
+
+What it does not do:
+  - it never looks inside the guest operating system (those checks are yours)
+  - it never deletes the old VM, its NIC, disks or snapshots
+  - it does not move identity, load balancer membership, availability set or locks:
+    it lists them before the start and you do them by hand
+
+<span class="y">BACKUP: the script never touches Azure Backup. The new VM is NOT enrolled: enable backup by hand after validation.</span>
+<span class="y">EXTENSIONS: the script never installs VM extensions. The new VM has none: install them by hand (the old VM's list is </span>
+<span class="y">shown).</span>
+
+Already signed in as 'operator@contoso.com'. Use this session? [Y/n] <span class="in">y</span>
+<span class="d">  ... Reading the subscriptions you can access...</span>
+
+<span class="c">Subscription where the VM lives:</span>
+  [1] Connectivity Hub  (00000000-0000-0000-0000-000000000001)
+  [2] Workload Production  (00000000-0000-0000-0000-000000000002)
+  [3] Workload Staging  (00000000-0000-0000-0000-000000000003)
+Subscription number <span class="in">2</span>
+Name of the VM to migrate <span class="in">srv-app01</span>
+<span class="d">  ... Looking for the VM in the subscription...</span></pre></div><div class="fd">The screen is cleared and the script explains what it does and what it does not. If an Azure session is already open it asks whether to use it; otherwise it runs <code>Connect-AzAccount</code> (next screen). The subscription is chosen from a list; the VM is found by name across the subscription. Backup and extensions are already flagged in yellow.</div></figure><figure><figcaption><span class="fn">Screen 2</span>Sign-in with an MFA request (<code>-RequireMfa</code> option)</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="c">Signing in with Connect-AzAccount ...</span>
+<span class="y">MFA requested at sign-in: complete it in the browser.</span>
+<span class="d">  ... Reading the subscriptions you can access...</span></pre></div><div class="fd">With <code>-RequireMfa</code> (or <code>-ClaimsChallenge</code>) the script does not reuse the existing session: it opens the browser and asks for the MFA straight away, so the later changes are not refused.</div></figure><figure><figcaption><span class="fn">Screen 3</span>More than one VM with the same name</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="y">More than one VM is called 'srv-app01':</span>
+  [1] resource group rg-app-prod (westeurope)
+  [2] resource group rg-app-staging (westeurope)
+Number <span class="in">1</span></pre></div><div class="fd">If VMs with the same name exist in different resource groups, the script asks which one to use.</div></figure><figure><figcaption><span class="fn">Screen 4</span>Manual checks</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="y">MANUAL CHECKS - to be completed by the team BEFORE you go on</span>
+<span class="d">============================================================</span>
+
+  [ ] Temp-disk remediation done (page file / swap, SQL tempdb, services and tasks on the temporary drive,
+  [ ]    /etc/fstab entries for /mnt) and the VM rebooted cleanly on its CURRENT size
+  [ ] The guest network interface is on DHCP: no static IPv4 address configured inside the operating system
+  [ ] Application owners informed, change window agreed
+  [ ] DNS, firewall and allow-list dependencies listed, so they can be reverted in case of rollback
+  [ ] Drive letters / mount points recorded (the script records disks and LUNs, not drive letters)
+  [ ] Backup: the script does not touch it and the NEW VM will NOT be protected: enable it by hand after validation
+  [ ] Extensions: the script does not install them: note the extensions of the VM (settings and keys included) to 
+reinstall them on the new VM
+
+Have ALL the checks above been completed? [y/N] <span class="in">y</span></pre></div><div class="fd">The list of what the team must have done <b>inside the VM</b> before starting. Answering <code>n</code> stops the script without touching anything. The <code>y</code> answer is recorded in the state file.</div></figure><figure><figcaption><span class="fn">Screen 5</span>Choosing the new size</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="d">  ... Reading the VM configuration (disks, network, extensions)...</span>
+<span class="d">  ... Checking the target sizes against the subscription (region, zone, quota)...</span>
+<span class="c">CHOOSE THE NEW SIZE</span>
+<span class="d">===================================================================================================</span>
+<span class="g">CURRENT VM - RUNNING                                      </span><span class="d"> | </span><span class="r">NEW VM - NOT CREATED YET                                  </span>
+<span class="d">-----------------------------------------------------------+-----------------------------------------------------------</span>
+<span class="g">Resource group : rg-app-prod                              </span><span class="d"> | </span><span class="r">(new size not chosen yet)                                 </span>
+<span class="g">VM name        : srv-app01                                </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">Size           : Standard_B2ms                            </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">Security type  : TrustedLaunch                            </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">Public IP      : 20.50.100.12 (pip-srv-app01)             </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">NICs           : 1                                        </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  nic-srv-app01: 10.20.1.10 (Static)                      </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">OS disk        : srv-app01-osdisk                         </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">Data disks     :                                          </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  LUN 0  srv-app01-data0 (128 GB)                         </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  LUN 1  srv-app01-data1 (256 GB)                         </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">Extensions     :                                          </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  AzureMonitorWindowsAgent (Succeeded)                    </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  IaaSAntimalware (Succeeded)                             </span><span class="d"> | </span><span class="r">                                                          </span>
+
+<span class="c">Current size: Standard_B2ms   (2 vCPU / 8 GiB, Hyper-V V2, zone '')</span>
+<span class="c">Target sizes from the playbook:</span>
+<span class="d">  [1] Standard_B2ls_v2      2 vCPU     4 GiB  Smaller NOT USABLE: Target would reduce memory (8 -&gt; 4 GiB).</span>
+<span class="g">  [2] Standard_B2s_v2       2 vCPU     8 GiB  Exact   available (proposed by the mapping)</span>
+<span class="g">  [3] Standard_B4s_v2       4 vCPU    16 GiB  Upsize  available</span>
+<span class="g">  [4] Standard_B8s_v2       8 vCPU    32 GiB  Upsize  available</span>
+<span class="g">  [5] Standard_B16s_v2     16 vCPU    64 GiB  Upsize  available</span>
+<span class="d">  [6] Standard_D2ls_v6      2 vCPU     4 GiB  Smaller NOT USABLE: Target would reduce memory (8 -&gt; 4 GiB).</span>
+<span class="g">  [7] Standard_D4ls_v6      4 vCPU     8 GiB  Upsize  available</span>
+<span class="g">  [8] Standard_D8ls_v6      8 vCPU    16 GiB  Upsize  available</span>
+New size number (Enter = proposed) <span class="in"></span></pre></div><div class="fd">On the left the current VM, on the right (still empty) the new one. Below, the playbook sizes checked against your subscription: availability in the region and zone of the VM, vCPU quota, generation support (Gen1/Gen2) and no reduction of vCPU or memory. Sizes that cannot be used are grey, with the reason. Enter accepts the size proposed by the mapping.</div></figure><figure><figcaption><span class="fn">Screen 6</span>Deployment plan and acknowledgement of what stays manual</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="d">  ... Looking for free placeholder addresses in the subnet(s)...</span>
+<span class="c">DEPLOYMENT PLAN</span>
+<span class="d">===================================================================================================</span>
+<span class="g">CURRENT VM - RUNNING                                      </span><span class="d"> | </span><span class="r">NEW VM - NOT CREATED YET                                  </span>
+<span class="d">-----------------------------------------------------------+-----------------------------------------------------------</span>
+<span class="g">Resource group : rg-app-prod                              </span><span class="d"> | </span><span class="r">Resource group : rg-app-prod                              </span>
+<span class="g">VM name        : srv-app01                                </span><span class="d"> | </span><span class="r">VM name        : srv-app01-mig                            </span>
+<span class="g">Size           : Standard_B2ms                            </span><span class="d"> | </span><span class="r">Size           : Standard_B2s_v2 (Exact)                  </span>
+<span class="g">Security type  : TrustedLaunch                            </span><span class="d"> | </span><span class="r">Security type  : TrustedLaunch (same)                     </span>
+<span class="g">Public IP      : 20.50.100.12 (pip-srv-app01)             </span><span class="d"> | </span><span class="r">Public IP      : 20.50.100.12 (pip-srv-app01)             </span>
+<span class="g">NICs           : 1                                        </span><span class="d"> | </span><span class="r">NICs           : 1                                        </span>
+<span class="g">  nic-srv-app01: 10.20.1.10 (Static)                      </span><span class="d"> | </span><span class="r">  nic-srv-app01-mig: 10.20.1.10 (static, original IP)     </span>
+<span class="g">      -&gt; placeholder 10.20.1.4                            </span><span class="d"> | </span><span class="r">OS disk        : srv-app01-osdisk-mig                     </span>
+<span class="g">OS disk        : srv-app01-osdisk                         </span><span class="d"> | </span><span class="r">Data disks     :                                          </span>
+<span class="g">Data disks     :                                          </span><span class="d"> | </span><span class="r">  LUN 0  srv-app01-data0-mig (128 GB)                     </span>
+<span class="g">  LUN 0  srv-app01-data0 (128 GB)                         </span><span class="d"> | </span><span class="r">  LUN 1  srv-app01-data1-mig (256 GB)                     </span>
+<span class="g">  LUN 1  srv-app01-data1 (256 GB)                         </span><span class="d"> | </span><span class="r">Extensions     : none - install by hand                   </span>
+<span class="g">Extensions     :                                          </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  AzureMonitorWindowsAgent (Succeeded)                    </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  IaaSAntimalware (Succeeded)                             </span><span class="d"> | </span><span class="r">                                                          </span>
+
+<span class="y">NOT HANDLED BY THIS SCRIPT - the new VM is created without these, you do them by hand:</span>
+<span class="y">  - VM extensions: NONE is installed on the new VM. Install them by hand (settings and keys included). On the old VM: </span>
+<span class="y">AzureMonitorWindowsAgent [AzureMonitorWindowsAgent 1.0, Succeeded]; IaaSAntimalware [IaaSAntimalware 2.0, Succeeded]</span>
+<span class="y">  - System-assigned managed identity: the new VM gets a NEW principal ID. Re-enable the identity and re-grant every </span>
+<span class="y">role assignment and Key Vault access policy.</span>
+<span class="y">  - Load balancer / application gateway membership (1 reference(s)): the new VM is NOT added. Add it to the same pools </span>
+<span class="y">and rules.</span>
+<span class="y">  - Azure Backup: the new VM is NOT enrolled in backup. Enable it by hand after validation, once the old VM and its </span>
+<span class="y">backup item are dealt with.</span>
+
+Acknowledge that these are handled by hand (type 'ACKNOWLEDGE' to confirm, anything else cancels) <span class="in">ACKNOWLEDGE</span>
+
+<span class="c">The old VM 'srv-app01' will be shut down. Nothing of it is deleted.</span>
+Proceed with the deployment? [y/N] <span class="in">y</span></pre></div><div class="fd">The script has chosen, for every IP of the VM, the <b>first free address</b> of the subnet as a placeholder (<code>-&gt; placeholder 10.20.1.4</code>): the old NIC is parked there, so the new NIC can take the original IP. On the right is everything that will be applied to the new VM. Below, in yellow, what the script does <b>not</b> do: you must acknowledge it by typing <code>ACKNOWLEDGE</code>, then the final <code>Y/N</code>. Nothing has been changed in Azure up to this point.</div></figure><figure><figcaption><span class="fn">Screen 7</span>Deployment running: shutting down the original VM</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="c">DEPLOYING - do not close this window</span>
+<span class="d">===================================================================================================</span>
+<span class="g">CURRENT VM - RUNNING                                      </span><span class="d"> | </span><span class="r">NEW VM - NOT CREATED YET                                  </span>
+<span class="d">-----------------------------------------------------------+-----------------------------------------------------------</span>
+<span class="g">Resource group : rg-app-prod                              </span><span class="d"> | </span><span class="r">Resource group : rg-app-prod                              </span>
+<span class="g">VM name        : srv-app01                                </span><span class="d"> | </span><span class="r">VM name        : srv-app01-mig                            </span>
+<span class="g">Size           : Standard_B2ms                            </span><span class="d"> | </span><span class="r">Size           : Standard_B2s_v2 (Exact)                  </span>
+<span class="g">Security type  : TrustedLaunch                            </span><span class="d"> | </span><span class="r">Security type  : TrustedLaunch (same)                     </span>
+<span class="g">Public IP      : 20.50.100.12 (pip-srv-app01)             </span><span class="d"> | </span><span class="r">Public IP      : 20.50.100.12 (pip-srv-app01)             </span>
+<span class="g">NICs           : 1                                        </span><span class="d"> | </span><span class="r">NICs           : 1                                        </span>
+<span class="g">  nic-srv-app01: 10.20.1.10 (Static)                      </span><span class="d"> | </span><span class="r">  nic-srv-app01-mig: 10.20.1.10 (static, original IP)     </span>
+<span class="g">      -&gt; placeholder 10.20.1.4                            </span><span class="d"> | </span><span class="r">OS disk        : srv-app01-osdisk-mig                     </span>
+<span class="g">OS disk        : srv-app01-osdisk                         </span><span class="d"> | </span><span class="r">Data disks     :                                          </span>
+<span class="g">Data disks     :                                          </span><span class="d"> | </span><span class="r">  LUN 0  srv-app01-data0-mig (128 GB)                     </span>
+<span class="g">  LUN 0  srv-app01-data0 (128 GB)                         </span><span class="d"> | </span><span class="r">  LUN 1  srv-app01-data1-mig (256 GB)                     </span>
+<span class="g">  LUN 1  srv-app01-data1 (256 GB)                         </span><span class="d"> | </span><span class="r">Extensions     : none - install by hand                   </span>
+<span class="g">Extensions     :                                          </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  AzureMonitorWindowsAgent (Succeeded)                    </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  IaaSAntimalware (Succeeded)                             </span><span class="d"> | </span><span class="r">                                                          </span>
+
+<span class="c">Progress</span>
+<span class="g">  [x] Pre-flight checks</span>
+<span class="y">  [&gt;] Shut down and deallocate srv-app01</span>
+<span class="d">  [ ] Snapshot srv-app01-osdisk-snap-os-mig</span>
+<span class="d">  [ ] Create disk srv-app01-osdisk-mig (OS)</span>
+<span class="d">  [ ] Snapshot srv-app01-data0-snap-lun0-mig</span>
+<span class="d">  [ ] Create disk srv-app01-data0-mig (LUN 0)</span>
+<span class="d">  [ ] Snapshot srv-app01-data1-snap-lun1-mig</span>
+<span class="d">  [ ] Create disk srv-app01-data1-mig (LUN 1)</span>
+<span class="d">  [ ] Move old NIC nic-srv-app01 to its placeholder IP, detach the public IP</span>
+<span class="d">  [ ] Create NIC nic-srv-app01-mig with the original IP 10.20.1.10 and attach the public IP 20.50.100.12</span>
+<span class="d">  [ ] Create VM srv-app01-mig</span></pre></div><div class="fd">The progress list shows the state: <code>[x]</code> done, <code>[&gt;]</code> running, <code>[ ]</code> to do. The screen is redrawn after every step and the on/off state of the two VMs is refreshed when it changes.</div></figure><figure><figcaption><span class="fn">Screen 8</span>Deployment running: snapshots and disks</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="c">DEPLOYING - do not close this window</span>
+<span class="d">===================================================================================================</span>
+<span class="g">CURRENT VM - DEALLOCATED (off)                            </span><span class="d"> | </span><span class="r">NEW VM - NOT CREATED YET                                  </span>
+<span class="d">-----------------------------------------------------------+-----------------------------------------------------------</span>
+<span class="g">Resource group : rg-app-prod                              </span><span class="d"> | </span><span class="r">Resource group : rg-app-prod                              </span>
+<span class="g">VM name        : srv-app01                                </span><span class="d"> | </span><span class="r">VM name        : srv-app01-mig                            </span>
+<span class="g">Size           : Standard_B2ms                            </span><span class="d"> | </span><span class="r">Size           : Standard_B2s_v2 (Exact)                  </span>
+<span class="g">Security type  : TrustedLaunch                            </span><span class="d"> | </span><span class="r">Security type  : TrustedLaunch (same)                     </span>
+<span class="g">Public IP      : 20.50.100.12 (pip-srv-app01)             </span><span class="d"> | </span><span class="r">Public IP      : 20.50.100.12 (pip-srv-app01)             </span>
+<span class="g">NICs           : 1                                        </span><span class="d"> | </span><span class="r">NICs           : 1                                        </span>
+<span class="g">  nic-srv-app01: 10.20.1.10 (Static)                      </span><span class="d"> | </span><span class="r">  nic-srv-app01-mig: 10.20.1.10 (static, original IP)     </span>
+<span class="g">      -&gt; placeholder 10.20.1.4                            </span><span class="d"> | </span><span class="r">OS disk        : srv-app01-osdisk-mig                     </span>
+<span class="g">OS disk        : srv-app01-osdisk                         </span><span class="d"> | </span><span class="r">Data disks     :                                          </span>
+<span class="g">Data disks     :                                          </span><span class="d"> | </span><span class="r">  LUN 0  srv-app01-data0-mig (128 GB)                     </span>
+<span class="g">  LUN 0  srv-app01-data0 (128 GB)                         </span><span class="d"> | </span><span class="r">  LUN 1  srv-app01-data1-mig (256 GB)                     </span>
+<span class="g">  LUN 1  srv-app01-data1 (256 GB)                         </span><span class="d"> | </span><span class="r">Extensions     : none - install by hand                   </span>
+<span class="g">Extensions     :                                          </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  AzureMonitorWindowsAgent (Succeeded)                    </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  IaaSAntimalware (Succeeded)                             </span><span class="d"> | </span><span class="r">                                                          </span>
+
+<span class="c">Progress</span>
+<span class="g">  [x] Pre-flight checks</span>
+<span class="g">  [x] Shut down and deallocate srv-app01</span>
+<span class="g">  [x] Snapshot srv-app01-osdisk-snap-os-mig</span>
+<span class="g">  [x] Create disk srv-app01-osdisk-mig (OS)</span>
+<span class="g">  [x] Snapshot srv-app01-data0-snap-lun0-mig</span>
+<span class="y">  [&gt;] Create disk srv-app01-data0-mig (LUN 0)</span>
+<span class="d">  [ ] Snapshot srv-app01-data1-snap-lun1-mig</span>
+<span class="d">  [ ] Create disk srv-app01-data1-mig (LUN 1)</span>
+<span class="d">  [ ] Move old NIC nic-srv-app01 to its placeholder IP, detach the public IP</span>
+<span class="d">  [ ] Create NIC nic-srv-app01-mig with the original IP 10.20.1.10 and attach the public IP 20.50.100.12</span>
+<span class="d">  [ ] Create VM srv-app01-mig</span></pre></div><div class="fd">The original VM is <code>DEALLOCATED (off)</code>. Every snapshot carries the LUN of its source disk in the name (<code>-snap-os-</code>, <code>-snap-lun0-</code>...): useful if somebody has to intervene by hand later.</div></figure><figure><figcaption><span class="fn">Screen 9</span>Deployment running: the IP swap</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="c">DEPLOYING - do not close this window</span>
+<span class="d">===================================================================================================</span>
+<span class="g">CURRENT VM - DEALLOCATED (off)                            </span><span class="d"> | </span><span class="r">NEW VM - NOT CREATED YET                                  </span>
+<span class="d">-----------------------------------------------------------+-----------------------------------------------------------</span>
+<span class="g">Resource group : rg-app-prod                              </span><span class="d"> | </span><span class="r">Resource group : rg-app-prod                              </span>
+<span class="g">VM name        : srv-app01                                </span><span class="d"> | </span><span class="r">VM name        : srv-app01-mig                            </span>
+<span class="g">Size           : Standard_B2ms                            </span><span class="d"> | </span><span class="r">Size           : Standard_B2s_v2 (Exact)                  </span>
+<span class="g">Security type  : TrustedLaunch                            </span><span class="d"> | </span><span class="r">Security type  : TrustedLaunch (same)                     </span>
+<span class="g">Public IP      : 20.50.100.12 (pip-srv-app01) - moved     </span><span class="d"> | </span><span class="r">Public IP      : 20.50.100.12 (pip-srv-app01)             </span>
+<span class="g">NICs           : 1                                        </span><span class="d"> | </span><span class="r">NICs           : 1                                        </span>
+<span class="g">  nic-srv-app01: 10.20.1.10 (Static)                      </span><span class="d"> | </span><span class="r">  nic-srv-app01-mig: 10.20.1.10 (static, original IP)     </span>
+<span class="g">      -&gt; placeholder 10.20.1.4                            </span><span class="d"> | </span><span class="r">OS disk        : srv-app01-osdisk-mig                     </span>
+<span class="g">OS disk        : srv-app01-osdisk                         </span><span class="d"> | </span><span class="r">Data disks     :                                          </span>
+<span class="g">Data disks     :                                          </span><span class="d"> | </span><span class="r">  LUN 0  srv-app01-data0-mig (128 GB)                     </span>
+<span class="g">  LUN 0  srv-app01-data0 (128 GB)                         </span><span class="d"> | </span><span class="r">  LUN 1  srv-app01-data1-mig (256 GB)                     </span>
+<span class="g">  LUN 1  srv-app01-data1 (256 GB)                         </span><span class="d"> | </span><span class="r">Extensions     : none - install by hand                   </span>
+<span class="g">Extensions     :                                          </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  AzureMonitorWindowsAgent (Succeeded)                    </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  IaaSAntimalware (Succeeded)                             </span><span class="d"> | </span><span class="r">                                                          </span>
+
+<span class="c">Progress</span>
+<span class="g">  [x] Pre-flight checks</span>
+<span class="g">  [x] Shut down and deallocate srv-app01</span>
+<span class="g">  [x] Snapshot srv-app01-osdisk-snap-os-mig</span>
+<span class="g">  [x] Create disk srv-app01-osdisk-mig (OS)</span>
+<span class="g">  [x] Snapshot srv-app01-data0-snap-lun0-mig</span>
+<span class="g">  [x] Create disk srv-app01-data0-mig (LUN 0)</span>
+<span class="g">  [x] Snapshot srv-app01-data1-snap-lun1-mig</span>
+<span class="g">  [x] Create disk srv-app01-data1-mig (LUN 1)</span>
+<span class="g">  [x] Move old NIC nic-srv-app01 to its placeholder IP, detach the public IP</span>
+<span class="g">  [x] Create NIC nic-srv-app01-mig with the original IP 10.20.1.10 and attach the public IP 20.50.100.12</span>
+<span class="y">  [&gt;] Create VM srv-app01-mig</span></pre></div><div class="fd">The old NIC is on its placeholder and the public IP has been detached (<code>- moved</code>). Right after, the new NIC (with the original IP and the public IP) and the new VM are created.</div></figure><figure><figcaption><span class="fn">Screen 10</span>The end: automatic checks and tests to do</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="c">MIGRATION COMPLETED</span>
+<span class="d">===================================================================================================</span>
+<span class="g">CURRENT VM - DEALLOCATED (off)                            </span><span class="d"> | </span><span class="r">NEW VM - RUNNING                                          </span>
+<span class="d">-----------------------------------------------------------+-----------------------------------------------------------</span>
+<span class="g">Resource group : rg-app-prod                              </span><span class="d"> | </span><span class="r">Resource group : rg-app-prod                              </span>
+<span class="g">VM name        : srv-app01                                </span><span class="d"> | </span><span class="r">VM name        : srv-app01-mig                            </span>
+<span class="g">Size           : Standard_B2ms                            </span><span class="d"> | </span><span class="r">Size           : Standard_B2s_v2 (Exact)                  </span>
+<span class="g">Security type  : TrustedLaunch                            </span><span class="d"> | </span><span class="r">Security type  : TrustedLaunch (same)                     </span>
+<span class="g">Public IP      : 20.50.100.12 (pip-srv-app01) - moved     </span><span class="d"> | </span><span class="r">Public IP      : 20.50.100.12 (pip-srv-app01)             </span>
+<span class="g">NICs           : 1                                        </span><span class="d"> | </span><span class="r">NICs           : 1                                        </span>
+<span class="g">  nic-srv-app01: 10.20.1.10 (Static)                      </span><span class="d"> | </span><span class="r">  nic-srv-app01-mig: 10.20.1.10 (static, original IP)     </span>
+<span class="g">      -&gt; placeholder 10.20.1.4                            </span><span class="d"> | </span><span class="r">OS disk        : srv-app01-osdisk-mig                     </span>
+<span class="g">OS disk        : srv-app01-osdisk                         </span><span class="d"> | </span><span class="r">Data disks     :                                          </span>
+<span class="g">Data disks     :                                          </span><span class="d"> | </span><span class="r">  LUN 0  srv-app01-data0-mig (128 GB)                     </span>
+<span class="g">  LUN 0  srv-app01-data0 (128 GB)                         </span><span class="d"> | </span><span class="r">  LUN 1  srv-app01-data1-mig (256 GB)                     </span>
+<span class="g">  LUN 1  srv-app01-data1 (256 GB)                         </span><span class="d"> | </span><span class="r">Extensions     : none - install by hand                   </span>
+<span class="g">Extensions     :                                          </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  AzureMonitorWindowsAgent (Succeeded)                    </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  IaaSAntimalware (Succeeded)                             </span><span class="d"> | </span><span class="r">                                                          </span>
+
+<span class="g">Automatic checks: 36 total, 31 passed, 0 FAILED, 0 warnings</span>
+<span class="d">Full report: C:\Migrations\migration\srv-app01\validation-report.csv</span>
+
+<span class="y">STILL TO DO BY HAND on the new VM:</span>
+<span class="y">  - VM extensions: NONE is installed on the new VM. Install them by hand (settings and keys included). On the old VM: </span>
+<span class="y">AzureMonitorWindowsAgent [AzureMonitorWindowsAgent 1.0, Succeeded]; IaaSAntimalware [IaaSAntimalware 2.0, Succeeded]</span>
+<span class="y">  - System-assigned managed identity: the new VM gets a NEW principal ID. Re-enable the identity and re-grant every </span>
+<span class="y">role assignment and Key Vault access policy.</span>
+<span class="y">  - Load balancer / application gateway membership (1 reference(s)): the new VM is NOT added. Add it to the same pools </span>
+<span class="y">and rules.</span>
+<span class="y">  - Azure Backup: the new VM is NOT enrolled in backup. Enable it by hand after validation, once the old VM and its </span>
+<span class="y">backup item are dealt with.</span>
+
+<span class="c">TESTS TO DO NOW (guest and application, owned by the team):</span>
+  [ ] Guest interface is on DHCP and received the expected address (check inside the OS, not only the portal)
+  [ ] DNS servers correct; forward and reverse resolution working; no stale cached entries on clients
+  [ ] Drive letters / mount points match the pre-migration record (D: may have been reassigned)
+  [ ] Page file or swap on its new location, not on a temporary disk
+  [ ] No automatic-start service stopped, no failed systemd unit, no new errors in the system event log
+  [ ] Domain-joined Windows: AD trust relationship intact
+  [ ] SQL Server: service running and tempdb up from its relocated path
+  [ ] Application owner confirms a representative transaction, database connectivity and scheduled jobs
+  [ ] Inbound/outbound connectivity and reachability from dependent systems on the expected ports
+
+<span class="y">KEEP THE SOURCE VM 'srv-app01' SWITCHED OFF while you test 'srv-app01-mig'.</span>
+<span class="y">Both machines share hostname, SID and AD computer account: starting both can break the AD trust.</span>
+<span class="y">After the owner has signed off, the old VM, NIC, disks and snapshots are removed by hand.</span>
+
+Press Enter to exit: <span class="in"></span></pre></div><div class="fd">The new VM is running, the old one stays off. The script compares the new VM with the recorded configuration (section 8), then shows what is left to do by hand, the tests inside the guest and the reminder to <b>keep the source VM switched off</b>. Pressing Enter ends the script.</div></figure><figure><figcaption><span class="fn">Screen 11</span>The end, with failed checks</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="c">MIGRATION COMPLETED</span>
+<span class="d">===================================================================================================</span>
+<span class="g">CURRENT VM - DEALLOCATED (off)                            </span><span class="d"> | </span><span class="r">NEW VM - RUNNING                                          </span>
+<span class="d">-----------------------------------------------------------+-----------------------------------------------------------</span>
+<span class="g">Resource group : rg-app-prod                              </span><span class="d"> | </span><span class="r">Resource group : rg-app-prod                              </span>
+<span class="g">VM name        : srv-app01                                </span><span class="d"> | </span><span class="r">VM name        : srv-app01-mig                            </span>
+<span class="g">Size           : Standard_B2ms                            </span><span class="d"> | </span><span class="r">Size           : Standard_B2s_v2 (Exact)                  </span>
+<span class="g">Security type  : TrustedLaunch                            </span><span class="d"> | </span><span class="r">Security type  : TrustedLaunch (same)                     </span>
+<span class="g">Public IP      : 20.50.100.12 (pip-srv-app01) - moved     </span><span class="d"> | </span><span class="r">Public IP      : 20.50.100.12 (pip-srv-app01)             </span>
+<span class="g">NICs           : 1                                        </span><span class="d"> | </span><span class="r">NICs           : 1                                        </span>
+<span class="g">  nic-srv-app01: 10.20.1.10 (Static)                      </span><span class="d"> | </span><span class="r">  nic-srv-app01-mig: 10.20.1.10 (static, original IP)     </span>
+<span class="g">      -&gt; placeholder 10.20.1.4                            </span><span class="d"> | </span><span class="r">OS disk        : srv-app01-osdisk-mig                     </span>
+<span class="g">OS disk        : srv-app01-osdisk                         </span><span class="d"> | </span><span class="r">Data disks     :                                          </span>
+<span class="g">Data disks     :                                          </span><span class="d"> | </span><span class="r">  LUN 0  srv-app01-data0-mig (128 GB)                     </span>
+<span class="g">  LUN 0  srv-app01-data0 (128 GB)                         </span><span class="d"> | </span><span class="r">  LUN 1  srv-app01-data1-mig (256 GB)                     </span>
+<span class="g">  LUN 1  srv-app01-data1 (256 GB)                         </span><span class="d"> | </span><span class="r">Extensions     : none - install by hand                   </span>
+<span class="g">Extensions     :                                          </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  AzureMonitorWindowsAgent (Succeeded)                    </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  IaaSAntimalware (Succeeded)                             </span><span class="d"> | </span><span class="r">                                                          </span>
+
+<span class="r">Automatic checks: 36 total, 33 passed, 2 FAILED, 1 warnings</span>
+<span class="r">  FAIL  NIC / nic-srv-app01-mig/ipconfig1 public IP: expected '/subscriptions/.../publicIPAddresses/pip-srv-app01', </span>
+<span class="r">found ''</span>
+<span class="r">  FAIL  Disk / LUN 1 caching: expected 'ReadOnly', found 'None'</span>
+<span class="y">  WARN  VM / Hybrid Benefit (license type): expected 'Windows_Server', found ''</span>
+<span class="d">Full report: C:\Migrations\migration\srv-app01\validation-report.csv</span>
+<span class="d">  ...</span></pre></div><div class="fd">Failed checks (<code>FAIL</code>) and warnings (<code>WARN</code>) are listed under the summary; the complete detail is in <code>validation-report.csv</code>. With a <code>FAIL</code> do not consider the migration good: fix the difference by hand, or roll back (section 6).</div></figure>
+</section>
+<section id="blocks"><h2>4. When the script stops before starting</h2>
+<p>Everything that happens <b>up to the final <code>Y/N</code></b> is read-only. If the script stops in this phase it prints <code>Nothing was changed in Azure</code>: fix the cause and run it again, it starts from scratch.</p>
+<div class="tbl"><table class=""><thead><tr><th>Situation</th><th>Why</th><th>What to do</th></tr></thead><tbody><tr><td>VM not migratable</td><td>Unmanaged or ephemeral OS disk, scale set member, Ultra SSD enabled, confidential security type, Azure Disk Encryption, shared disk, Ultra/PremiumV2 disk, IPv6 configuration</td><td>Handle the VM separately: the script does not touch it</td></tr><tr><td>No usable size</td><td>Size not offered or restricted in the region/zone, vCPU quota too low, generation not supported, vCPU or memory would be reduced</td><td>Ask for quota or pick another region/zone; for Gen1 convert the disk</td></tr><tr><td>No free IP</td><td>The subnet has no free address to use as a placeholder</td><td>Free an address and run again</td></tr><tr><td>Names already in use</td><td>VMs, NICs, disks or snapshots with the <code>-mig</code> names already exist</td><td>Remove them or roll back the earlier attempt</td></tr><tr><td>Manual checks not confirmed / <code>ACKNOWLEDGE</code> not typed / <code>N</code> at the deployment question</td><td>The operator chose not to go on</td><td>Nothing: no change was made</td></tr></tbody></table></div>
+<figure><figcaption><span class="fn">Screen 12</span>A VM the script cannot migrate</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="c">THIS VM CANNOT BE MIGRATED BY THE SCRIPT</span>
+<span class="d">===================================================================================================</span>
+
+<span class="r">  BLOCKER: Azure Disk Encryption extension 'AzureDiskEncryption' present: handle this VM separately.</span>
+<span class="r">  BLOCKER: Disk 'srv-app01-data1' is a shared disk: not supported.</span>
+</pre></div><div class="fd">The script lists the reasons and stops. Nothing has been changed.</div></figure><figure><figcaption><span class="fn">Screen 13</span>No usable size</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="c">Target sizes from the playbook:</span>
+<span class="d">  [1] Standard_B2ls_v2      2 vCPU     4 GiB  Smaller NOT USABLE: Target would reduce memory (8 -&gt; 4 GiB).</span>
+<span class="d">  [2] Standard_B2s_v2       2 vCPU     8 GiB  Exact   NOT USABLE: Target size is not offered in zone 2 of 'westeurope'.</span>
+<span class="d">  [3] Standard_B4s_v2       4 vCPU    16 GiB  Upsize  NOT USABLE: vCPU quota for family 'standardBsv2Family' is </span>
+<span class="d">insufficient (8/10 used, 4 needed).</span>
+<span class="d">  [4] Standard_B8s_v2       8 vCPU    32 GiB  Upsize  NOT USABLE: Target size is restricted in 'westeurope' </span>
+<span class="d">(NotAvailableForSubscription).</span>
+<span class="d">  ...</span>
+
+<span class="r">STOPPED: None of the target sizes can be used for this VM in this subscription (see the list above).</span>
+<span class="y">Nothing was changed in Azure. Fix the cause and run the script again.</span></pre></div><div class="fd">If every size is unusable the script says so and stops. In the example there are four different causes.</div></figure><figure><figcaption><span class="fn">Screen 14</span>Generation 1 and v6 sizes</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="c">Current size: Standard_F4s_v2   (4 vCPU / 8 GiB, Hyper-V V1, zone '')</span>
+<span class="c">Target sizes from the playbook:</span>
+<span class="d">  [6] Standard_D2ls_v6      2 vCPU     4 GiB  Smaller NOT USABLE: Target would reduce memory (8 -&gt; 4 GiB).</span>
+<span class="d">  [7] Standard_D4ls_v6      4 vCPU     8 GiB  Exact   NOT USABLE: Target size does not support Hyper-V generation V1 </span>
+<span class="d">(supports: V2). A Gen1 to Gen2 conversion is required first.</span>
+<span class="d">  [8] Standard_D8ls_v6      8 vCPU    16 GiB  Upsize  NOT USABLE: Target size does not support Hyper-V generation V1 </span>
+<span class="d">(supports: V2). A Gen1 to Gen2 conversion is required first.</span></pre></div><div class="fd">Dlsv6 sizes do not support Generation 1 VMs: the OS disk must first be converted from Gen1 to Gen2. Which sizes support which generation is decided by Azure at that moment: the script reads the real capabilities of the size in your subscription.</div></figure><figure><figcaption><span class="fn">Screen 15</span>No free IP for the placeholder</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="r">STOPPED: No free IP address available in subnet 'snet-app' (10.20.1.0/24) for nic-srv-app01|ipconfig1. Free an address </span>
+<span class="r">and run the script again.</span>
+<span class="y">Nothing was changed in Azure. Fix the cause and run the script again.</span></pre></div></figure><figure><figcaption><span class="fn">Screen 16</span>Names already in use</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="c">NAMES ALREADY IN USE</span>
+<span class="d">===================================================================================================</span>
+<span class="r">  already exists: VM srv-app01-mig</span>
+<span class="r">  already exists: disk srv-app01-osdisk-mig</span>
+<span class="r">  already exists: snapshot srv-app01-osdisk-snap-os-mig</span>
+<span class="r">Remove or rename these resources (or roll back an earlier attempt), then run the script again.</span></pre></div><div class="fd">This happens when resources with the names the script wants already exist (usually an earlier attempt). Remove them by hand or roll that attempt back.</div></figure><figure><figcaption><span class="fn">Screen 17</span>Confirmations not given</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre>Acknowledge that these are handled by hand (type 'ACKNOWLEDGE' to confirm, anything else cancels) <span class="in">ok</span>
+<span class="y">Not acknowledged: nothing was changed.</span>
+
+Proceed with the deployment? [y/N] <span class="in">n</span>
+<span class="y">Cancelled: nothing was changed.</span>
+
+Have ALL the checks above been completed? [y/N] <span class="in">n</span>
+<span class="y">Stopped: complete the manual checks first.</span></pre></div><div class="fd">Each of the three confirmations (manual checks, <code>ACKNOWLEDGE</code>, final <code>Y/N</code>) stops the script without changing anything.</div></figure>
+</section>
+<section id="interruptions"><h2>5. Interruptions, MFA and resume</h2>
+<p>The deployment is <b>checkpointed</b>: after every step the state is saved to disk. An error, a closed window or a network failure do not lose the work already done.</p>
+<figure><figcaption><span class="fn">Screen 18</span>Azure asks for MFA during the deployment</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="c">DEPLOYING - do not close this window</span>
+<span class="d">===================================================================================================</span>
+<span class="g">CURRENT VM - DEALLOCATED (off)                            </span><span class="d"> | </span><span class="r">NEW VM - NOT CREATED YET                                  </span>
+<span class="d">-----------------------------------------------------------+-----------------------------------------------------------</span>
+<span class="g">Resource group : rg-app-prod                              </span><span class="d"> | </span><span class="r">Resource group : rg-app-prod                              </span>
+<span class="g">VM name        : srv-app01                                </span><span class="d"> | </span><span class="r">VM name        : srv-app01-mig                            </span>
+<span class="g">Size           : Standard_B2ms                            </span><span class="d"> | </span><span class="r">Size           : Standard_B2s_v2 (Exact)                  </span>
+<span class="g">Security type  : TrustedLaunch                            </span><span class="d"> | </span><span class="r">Security type  : TrustedLaunch (same)                     </span>
+<span class="g">Public IP      : 20.50.100.12 (pip-srv-app01)             </span><span class="d"> | </span><span class="r">Public IP      : 20.50.100.12 (pip-srv-app01)             </span>
+<span class="g">NICs           : 1                                        </span><span class="d"> | </span><span class="r">NICs           : 1                                        </span>
+<span class="g">  nic-srv-app01: 10.20.1.10 (Static)                      </span><span class="d"> | </span><span class="r">  nic-srv-app01-mig: 10.20.1.10 (static, original IP)     </span>
+<span class="g">      -&gt; placeholder 10.20.1.4                            </span><span class="d"> | </span><span class="r">OS disk        : srv-app01-osdisk-mig                     </span>
+<span class="g">OS disk        : srv-app01-osdisk                         </span><span class="d"> | </span><span class="r">Data disks     :                                          </span>
+<span class="g">Data disks     :                                          </span><span class="d"> | </span><span class="r">  LUN 0  srv-app01-data0-mig (128 GB)                     </span>
+<span class="g">  LUN 0  srv-app01-data0 (128 GB)                         </span><span class="d"> | </span><span class="r">  LUN 1  srv-app01-data1-mig (256 GB)                     </span>
+<span class="g">  LUN 1  srv-app01-data1 (256 GB)                         </span><span class="d"> | </span><span class="r">Extensions     : none - install by hand                   </span>
+<span class="g">Extensions     :                                          </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  AzureMonitorWindowsAgent (Succeeded)                    </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  IaaSAntimalware (Succeeded)                             </span><span class="d"> | </span><span class="r">                                                          </span>
+
+<span class="c">Progress</span>
+<span class="g">  [x] Pre-flight checks</span>
+<span class="g">  [x] Shut down and deallocate srv-app01</span>
+<span class="g">  [x] Snapshot srv-app01-osdisk-snap-os-mig</span>
+<span class="g">  [x] Create disk srv-app01-osdisk-mig (OS)</span>
+<span class="g">  [x] Snapshot srv-app01-data0-snap-lun0-mig</span>
+<span class="y">  [&gt;] Create disk srv-app01-data0-mig (LUN 0)</span>
+<span class="d">  [ ] Snapshot srv-app01-data1-snap-lun1-mig</span>
+<span class="d">  [ ] Create disk srv-app01-data1-mig (LUN 1)</span>
+<span class="d">  [ ] Move old NIC nic-srv-app01 to its placeholder IP, detach the public IP</span>
+<span class="d">  [ ] Create NIC nic-srv-app01-mig with the original IP 10.20.1.10 and attach the public IP 20.50.100.12</span>
+<span class="d">  [ ] Create VM srv-app01-mig</span>
+
+<span class="y">  ! Azure requested a claims challenge (MFA): signing in again</span>
+
+<span class="y">Azure asks for a stronger sign-in (MFA) before it accepts changes. A browser window opens: complete the sign-in.</span></pre></div><div class="fd">Some tenants refuse changes if the sign-in has not passed MFA. The script recognizes Azure&#39;s request, opens the browser to sign in again and <b>repeats the refused step by itself</b>. The yellow note stays in the list below. To avoid the situation altogether, start the script with <code>-RequireMfa</code>.</div></figure><figure><figcaption><span class="fn">Screen 19</span>The script stops during the deployment</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre>
+<span class="r">STOPPED: The requested VM size Standard_B2s_v2 is currently not available in location 'westeurope' zone '1' </span>
+<span class="r">(AllocationFailed).</span>
+<span class="y">The deployment had started. The state is saved in C:\Migrations\migration\srv-app01. Fix the cause and run the script </span>
+<span class="y">again on the same VM: you can resume or roll back.</span></pre></div><div class="fd">Any Azure error during the deployment stops the script. The state is already saved up to the last completed step: nothing is deleted.</div></figure><figure><figcaption><span class="fn">Screen 20</span>Resuming the deployment</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="c">A MIGRATION OF THIS VM ALREADY EXISTS</span>
+<span class="d">===================================================================================================</span>
+<span class="g">CURRENT VM - DEALLOCATED (off)                            </span><span class="d"> | </span><span class="r">NEW VM - NOT CREATED YET                                  </span>
+<span class="d">-----------------------------------------------------------+-----------------------------------------------------------</span>
+<span class="g">Resource group : rg-app-prod                              </span><span class="d"> | </span><span class="r">Resource group : rg-app-prod                              </span>
+<span class="g">VM name        : srv-app01                                </span><span class="d"> | </span><span class="r">VM name        : srv-app01-mig                            </span>
+<span class="g">Size           : Standard_B2ms                            </span><span class="d"> | </span><span class="r">Size           : Standard_B2s_v2 (Exact)                  </span>
+<span class="g">Security type  : TrustedLaunch                            </span><span class="d"> | </span><span class="r">Security type  : TrustedLaunch (same)                     </span>
+<span class="g">Public IP      : 20.50.100.12 (pip-srv-app01)             </span><span class="d"> | </span><span class="r">Public IP      : 20.50.100.12 (pip-srv-app01)             </span>
+<span class="g">NICs           : 1                                        </span><span class="d"> | </span><span class="r">NICs           : 1                                        </span>
+<span class="g">  nic-srv-app01: 10.20.1.10 (Static)                      </span><span class="d"> | </span><span class="r">  nic-srv-app01-mig: 10.20.1.10 (static, original IP)     </span>
+<span class="g">      -&gt; placeholder 10.20.1.4                            </span><span class="d"> | </span><span class="r">OS disk        : srv-app01-osdisk-mig                     </span>
+<span class="g">OS disk        : srv-app01-osdisk                         </span><span class="d"> | </span><span class="r">Data disks     :                                          </span>
+<span class="g">Data disks     :                                          </span><span class="d"> | </span><span class="r">  LUN 0  srv-app01-data0-mig (128 GB)                     </span>
+<span class="g">  LUN 0  srv-app01-data0 (128 GB)                         </span><span class="d"> | </span><span class="r">  LUN 1  srv-app01-data1-mig (256 GB)                     </span>
+<span class="g">  LUN 1  srv-app01-data1 (256 GB)                         </span><span class="d"> | </span><span class="r">Extensions     : none - install by hand                   </span>
+<span class="g">Extensions     :                                          </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  AzureMonitorWindowsAgent (Succeeded)                    </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  IaaSAntimalware (Succeeded)                             </span><span class="d"> | </span><span class="r">                                                          </span>
+
+<span class="c">Progress</span>
+<span class="g">  [x] Pre-flight checks</span>
+<span class="g">  [x] Shut down and deallocate srv-app01</span>
+<span class="g">  [x] Snapshot srv-app01-osdisk-snap-os-mig</span>
+<span class="g">  [x] Create disk srv-app01-osdisk-mig (OS)</span>
+<span class="g">  [x] Snapshot srv-app01-data0-snap-lun0-mig</span>
+<span class="g">  [x] Create disk srv-app01-data0-mig (LUN 0)</span>
+<span class="g">  [x] Snapshot srv-app01-data1-snap-lun1-mig</span>
+<span class="g">  [x] Create disk srv-app01-data1-mig (LUN 1)</span>
+<span class="d">  [ ] Move old NIC nic-srv-app01 to its placeholder IP, detach the public IP</span>
+<span class="d">  [ ] Create NIC nic-srv-app01-mig with the original IP 10.20.1.10 and attach the public IP 20.50.100.12</span>
+<span class="d">  [ ] Create VM srv-app01-mig</span>
+
+<span class="y">  ! Step 'p3.new-vm' failed: The requested VM size Standard_B2s_v2 is currently not available...</span>
+
+  [R] Resume the deployment from the last completed step
+  [B] Roll back (delete the new VM, give the original IP back to the old VM and start it)
+  [Q] Quit
+Choose: <span class="in">R</span></pre></div><div class="fd">Running the script again on the same VM (same folder) shows this menu. <code>R</code> resumes from the first step not completed (steps already done are skipped); <code>B</code> rolls back; <code>Q</code> quits. After <code>R</code> the deployment goes on with the same screens as before and, at the end, the automatic checks.</div></figure>
+<div class="callout note"><b>Window closed in the middle of a step</b><div>That step is run again on resume. If Azure answers that the resource already exists, read the message: it normally ends with a rollback and a new attempt.</div></div>
+<div class="callout warn"><b>Before resuming</b><div>Understand the cause of the error. Resuming without having solved it repeats the same error. While the deployment is interrupted the original VM may already be off: do not start it by hand if the new one exists and is running.</div></div>
+</section>
+<section id="existing"><h2>6. A VM already migrated: re-check and rollback</h2>
+<p>Running the script again on the name of a VM that already has a migration in progress or completed (from the same folder) <b>does not start over</b>: it shows the state and offers a menu.</p>
+<div class="tbl"><table class=""><thead><tr><th>Situation</th><th>Menu options</th></tr></thead><tbody><tr><td>Deployment interrupted</td><td><code>R</code> resume &middot; <code>B</code> rollback &middot; <code>Q</code> quit</td></tr><tr><td>Deployment completed</td><td><code>V</code> re-check &middot; <code>B</code> rollback &middot; <code>Q</code> quit</td></tr><tr><td>After a rollback</td><td>No menu: the state is cleared and a new run starts from scratch</td></tr></tbody></table></div>
+<figure><figcaption><span class="fn">Screen 21</span>Re-checking a completed migration</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="c">A MIGRATION OF THIS VM ALREADY EXISTS</span>
+<span class="d">===================================================================================================</span>
+<span class="g">CURRENT VM - DEALLOCATED (off)                            </span><span class="d"> | </span><span class="r">NEW VM - RUNNING                                          </span>
+<span class="d">-----------------------------------------------------------+-----------------------------------------------------------</span>
+<span class="g">Resource group : rg-app-prod                              </span><span class="d"> | </span><span class="r">Resource group : rg-app-prod                              </span>
+<span class="g">VM name        : srv-app01                                </span><span class="d"> | </span><span class="r">VM name        : srv-app01-mig                            </span>
+<span class="g">Size           : Standard_B2ms                            </span><span class="d"> | </span><span class="r">Size           : Standard_B2s_v2 (Exact)                  </span>
+<span class="g">Security type  : TrustedLaunch                            </span><span class="d"> | </span><span class="r">Security type  : TrustedLaunch (same)                     </span>
+<span class="g">Public IP      : 20.50.100.12 (pip-srv-app01) - moved     </span><span class="d"> | </span><span class="r">Public IP      : 20.50.100.12 (pip-srv-app01)             </span>
+<span class="g">NICs           : 1                                        </span><span class="d"> | </span><span class="r">NICs           : 1                                        </span>
+<span class="g">  nic-srv-app01: 10.20.1.10 (Static)                      </span><span class="d"> | </span><span class="r">  nic-srv-app01-mig: 10.20.1.10 (static, original IP)     </span>
+<span class="g">      -&gt; placeholder 10.20.1.4                            </span><span class="d"> | </span><span class="r">OS disk        : srv-app01-osdisk-mig                     </span>
+<span class="g">OS disk        : srv-app01-osdisk                         </span><span class="d"> | </span><span class="r">Data disks     :                                          </span>
+<span class="g">Data disks     :                                          </span><span class="d"> | </span><span class="r">  LUN 0  srv-app01-data0-mig (128 GB)                     </span>
+<span class="g">  LUN 0  srv-app01-data0 (128 GB)                         </span><span class="d"> | </span><span class="r">  LUN 1  srv-app01-data1-mig (256 GB)                     </span>
+<span class="g">  LUN 1  srv-app01-data1 (256 GB)                         </span><span class="d"> | </span><span class="r">Extensions     : none - install by hand                   </span>
+<span class="g">Extensions     :                                          </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  AzureMonitorWindowsAgent (Succeeded)                    </span><span class="d"> | </span><span class="r">                                                          </span>
+<span class="g">  IaaSAntimalware (Succeeded)                             </span><span class="d"> | </span><span class="r">                                                          </span>
+
+<span class="c">Progress</span>
+<span class="g">  [x] Pre-flight checks</span>
+<span class="g">  [x] Shut down and deallocate srv-app01</span>
+<span class="g">  [x] Snapshot srv-app01-osdisk-snap-os-mig</span>
+<span class="g">  [x] Create disk srv-app01-osdisk-mig (OS)</span>
+<span class="g">  [x] Snapshot srv-app01-data0-snap-lun0-mig</span>
+<span class="g">  [x] Create disk srv-app01-data0-mig (LUN 0)</span>
+<span class="g">  [x] Snapshot srv-app01-data1-snap-lun1-mig</span>
+<span class="g">  [x] Create disk srv-app01-data1-mig (LUN 1)</span>
+<span class="g">  [x] Move old NIC nic-srv-app01 to its placeholder IP, detach the public IP</span>
+<span class="g">  [x] Create NIC nic-srv-app01-mig with the original IP 10.20.1.10 and attach the public IP 20.50.100.12</span>
+<span class="g">  [x] Create VM srv-app01-mig</span>
+
+  [V] Run the automatic checks again
+  [B] Roll back (delete the new VM, give the original IP back to the old VM and start it)
+  [Q] Quit
+Choose: <span class="in">V</span>
+<span class="d">  ... Running the automatic checks...</span></pre></div><div class="fd">If the deployment was complete the menu offers <code>V</code>: it repeats the automatic checks and shows the final screen again with the list of what is left to do. Useful after fixing a difference by hand.</div></figure><figure><figcaption><span class="fn">Screen 22</span>Rollback</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre>Choose: <span class="in">B</span>
+
+  The replacement VM srv-app01-mig and its NICs will be DELETED.
+  Source srv-app01 gets its original IP(s) back and is started.
+  New disks and snapshots are kept unless you choose otherwise below.
+Roll back now? [y/N] <span class="in">y</span>
+Failure reason (recorded in the log; understand it before retrying): <span class="in">application does not start, DNS not resolving</span>
+<span class="y">2026-10-06 14:02:11 [WARN] Rollback requested. Reason: application does not start, DNS not resolving</span>
+<span class="c">2026-10-06 14:02:11 [STEP] Step: rb.stop-new</span>
+<span class="c">2026-10-06 14:02:58 [STEP] Step: rb.delete-new-vm</span>
+<span class="c">2026-10-06 14:03:40 [STEP] Step: rb.delete-new-nic.nic-srv-app01</span>
+<span class="c">2026-10-06 14:03:52 [STEP] Step: rb.restore-source-nic.nic-srv-app01</span>
+<span class="g">2026-10-06 14:04:10 [OK] Source NIC(s) hold the original address(es).</span>
+<span class="c">2026-10-06 14:04:10 [STEP] Step: rb.start-source</span>
+Also delete the new disks and snapshots created by the deployment (needed to retry the migration with the same names)? [y/N] <span class="in">y</span>
+<span class="c">2026-10-06 14:05:33 [STEP] Step: rb.delete-new-storage</span>
+
+<span class="c">MANUAL ROLLBACK CHECKLIST:</span>
+  [ ] Confirm from inside the guest that the interface received the original address and DNS servers are correct
+  [ ] Revert DNS records changed at cutover
+  [ ] Revert firewall rules, allow-lists, application configuration, monitoring and backup targets changed at cutover
+  [ ] Undo anything already done by hand on the new VM (identity grants, load balancer pools, backup) if the new VM was
+ touched
+  [ ] Confirm with the application owner that service is restored
+<span class="g">2026-10-06 14:05:34 [OK] Rollback complete. The deployment state was reset; the failure reason is in state.json </span>
+<span class="g">(history). Run the script again to start a new migration.</span>
+
+Press Enter to exit: <span class="in"></span></pre></div><div class="fd">The rollback stops and <b>deletes the new VM and its NICs</b>, gives the original VM&#39;s NIC its private IP and its public IP back, and starts the original VM. First it checks that the new VM is off: it never lets the two machines run together. It asks for the reason of the rollback (kept in the log and in <code>state.json</code>) and whether to delete the new disks and snapshots as well.</div></figure><figure><figcaption><span class="fn">Screen 23</span>Rollback when no deployment was started</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="y">Nothing to roll back: the deployment never started.</span></pre></div></figure>
+<h3>What the rollback does and does not do</h3>
+<div class="tbl"><table class=""><thead><tr><th>It does</th><th>It does not</th></tr></thead><tbody><tr><td><ul><li>Stops and deletes the new VM and its NICs (freeing the IPs, the public one included)</li><li>Gives the original NIC its private IP back (with the previous allocation type) and its public IP</li><li>Starts the original VM, after checking that the new one is off</li><li>On request, deletes the new disks and snapshots (needed to redo the migration with the same names)</li><li>Clears the state: you can start again from scratch</li></ul></td><td><ul><li>Does not undo what was done <b>by hand</b> on the new VM (identity, load balancer pools, backup, extensions, DNS, firewall): the final checklist reminds you</li><li>Does not touch the original VM except to bring it back as it was</li><li>Never deletes anything of the original VM</li></ul></td></tr></tbody></table></div>
+<div class="callout note"><b>When it can be done</b><div>As long as the original VM and its resources exist. Since the script never deletes them, the rollback stays possible until you remove them yourself, after sign-off.</div></div>
+</section>
+<section id="files"><h2>7. Work folder and files</h2>
+<p>For every VM the script creates a folder under <code>migration</code> (in the folder you launch it from, or under <code>-WorkRoot</code>).</p>
+<div class="term plain"><pre>C:\Migrations\                      &lt;- the folder you launch the script from
+  Invoke-VmSkuMigration.ps1
+  migration\
+    srv-app01\
+      config.json                     snapshot of the VM before it was touched
+      state.json                      progress, completed steps, placeholder IPs, rollback history
+      migration.log                   timestamped history
+      validation-report.csv           result of the automatic checks</pre></div>
+<div class="tbl"><table class=""><thead><tr><th>File</th><th>Content and use</th></tr></thead><tbody><tr><td><code>config.json</code></td><td>Everything read from the VM before touching it: compute, disks and LUNs, NICs and IPs, extensions (name, type, version, state), identity, locks, the "not handled" list. The deployment, the checks and the rollback rely on it. It is your starting documentation.</td></tr><tr><td><code>state.json</code></td><td>Progress: completed steps with date and time, placeholder IPs, resources created, confirmations given (who and when), rollback history with the reason. It is what makes resuming possible.</td></tr><tr><td><code>migration.log</code></td><td>History of everything the script did, with warnings and errors. The complete errors (with the stack) are here, not on screen.</td></tr><tr><td><code>validation-report.csv</code></td><td>One check per row: area, check, expected value, found value, result (PASS, FAIL, WARN, INFO). Opens in Excel.</td></tr></tbody></table></div>
+<h3>Examples</h3>
+<p><b>migration.log</b></p><div class="term plain"><pre>2026-10-06 14:31:07 [INFO] Created workspace C:\Migrations\migration\srv-app01
+2026-10-06 14:31:52 [OK] Context: operator@contoso.com | tenant 00000000-... | subscription Workload Production (00000000-...)
+2026-10-06 14:36:20 [STEP] Step: p3.preflight
+2026-10-06 14:36:29 [STEP] Step: p3.stop-source
+2026-10-06 14:37:14 [OK] Source VM is deallocated.
+2026-10-06 14:37:14 [STEP] Step: p3.snapshot.srv-app01-osdisk
+2026-10-06 14:37:41 [STEP] Step: p3.disk.srv-app01-osdisk
+2026-10-06 14:38:05 [INFO] Mapping: snapshot srv-app01-osdisk-snap-os-mig -&gt; disk srv-app01-osdisk-mig -&gt; LUN OS
+  ...
+2026-10-06 14:52:30 [OK] Deployment complete. Replacement VM srv-app01-mig is running; source VM srv-app01 stays deallocated.
+2026-10-06 14:52:58 [OK] Platform checks: 36 total, 0 FAIL. Report: C:\Migrations\migration\srv-app01\validation-report.csv</pre></div>
+<p><b>validation-report.csv</b></p><div class="term plain"><pre>"Area","Check","Expected","Actual","Result"
+"VM","Power state","running","running","PASS"
+"VM","Size","Standard_B2s_v2","Standard_B2s_v2","PASS"
+"VM","Source VM not running (golden rule)","deallocated","deallocated","PASS"
+"Disk","LUN 0 caching","ReadOnly","ReadOnly","PASS"
+"NIC","nic-srv-app01-mig/ipconfig1 private IP","10.20.1.10","10.20.1.10","PASS"
+"NIC","Source nic-srv-app01/ipconfig1 parked on placeholder","10.20.1.4","10.20.1.4","PASS"
+"Manual follow-up","Azure Backup: the new VM is NOT enrolled in backup...","done by hand","not checked by script","INFO"</pre></div>
+<p><b>state.json</b> (excerpt)</p><div class="term plain"><pre>{
+  "vmName": "srv-app01",
+  "phases": { "1": {"status": "done"}, "2": {"status": "done"}, "3": {"status": "done"}, "4": {"status": "PASS"} },
+  "steps":  { "p3.preflight": "2026-10-06T14:36:29", "p3.stop-source": "...", "p3.new-vm": "..." },
+  "placeholders": { "nic-srv-app01|ipconfig1": "10.20.1.4" },
+  "attestations": [ { "type": "manual-checks-confirmed" }, { "type": "complications-acknowledged", "count": 4 } ],
+  "history": [ { "event": "rollback", "reason": "application does not start" } ]
+}</pre></div>
+<div class="callout warn"><b>Do not delete the folder while a migration is in progress</b><div>Without it the script does not recognize the migration: it cannot resume or roll back in a guided way. Keep it until the change is closed. If the folder is synchronized by OneDrive, a locked file can cause errors: better to run the script from a local folder.</div></div>
+</section>
+<section id="checks"><h2>8. The automatic checks</h2>
+<p>At the end of the deployment (and when you choose <code>V</code>) the script compares the new VM with the snapshot of the configuration taken at the beginning. They are checks on the <b>Azure platform</b>: they look at nothing inside the VM.</p>
+<div class="tbl"><table class=""><thead><tr><th>Area</th><th>What is compared</th></tr></thead><tbody><tr><td>VM</td><td>Running state; provisioning succeeded; chosen size; original VM not running (golden rule); zone; security type; license (Hybrid Benefit); boot diagnostics enabled; generation; tags</td></tr><tr><td>Disks</td><td>Caching and SKU of the OS disk; number of data disks; for every LUN: name of the new disk, caching, size, SKU, zone</td></tr><tr><td>NIC</td><td>NIC attached to the VM; NSG; accelerated networking; DNS servers; for every IP configuration: private IP (must be the original), static allocation, public IP, ASGs; old NIC parked on the placeholder</td></tr><tr><td>Informational (INFO)</td><td>The list of what stays manual; the boot diagnostics screenshot (if it cannot be downloaded, look at it in the portal: VM &rarr; Boot diagnostics)</td></tr></tbody></table></div>
+<ul><li><b>FAIL</b>: a real difference. Fix it or roll back.</li><li><b>WARN</b>: look at it, it does not block.</li><li><b>INFO</b>: information.</li></ul>
+<p>The checks do <b>not</b> say the VM works: they say Azure created what was planned. Whether the operating system and the application work is verified with the tests in the final checklist.</p>
+</section>
+<section id="after"><h2>9. After the migration</h2>
+<ol>
+<li><b>Keep the original VM switched off</b> and test the new VM (checklist on screen and at the end of this guide). The original and the new VM share hostname, SID and Active Directory computer account: if both run, the trust can break and shutting one down does not repair it.</li>
+<li><b>Do by hand what is left</b> on the new VM, from the list shown at the end: extensions (with their settings and keys), managed identity and roles, load balancer pools, availability set (it cannot be added after creation), DNS, firewall, monitoring.</li>
+<li><b>Backup</b>: enable it on the new VM when the old one and its backup item have been dealt with. The restore points of the old VM cannot be transferred.</li>
+<li><b>Formal sign-off</b> from the application owner.</li>
+<li><b>Clean-up by hand</b>, only after sign-off and in this order: original VM &rarr; its NIC &rarr; (after the retention period, 14 days unless asked otherwise) original disks &rarr; snapshots. Before deleting the original VM check that its disks are not set to be deleted with the VM.</li>
+<li><b>Inventory</b>: update size and configuration.</li>
+</ol>
+<div class="callout stop"><b>If something is wrong</b><div>The rollback is available as long as the original VM exists. After you delete the original VM there is no automatic way back.</div></div>
+</section>
+<section id="rules"><h2>10. Safety rules, the playbook and limits</h2>
+<h3>The playbook golden rules and how the script applies them</h3>
+<div class="tbl"><table class=""><thead><tr><th>Rule</th><th>In the script</th></tr></thead><tbody><tr><td>Never two VMs running together (same hostname, SID, AD account)</td><td>Before creating the new VM and before starting the old one in the rollback it checks that the other is off; otherwise it stops</td></tr><tr><td>Never delete disks or snapshots before sign-off</td><td>The script deletes nothing of the original VM. It only deletes what it created itself, and only in the rollback</td></tr><tr><td>The temporary disk is always lost</td><td>Manual checks at the start; the guest part (pagefile, tempdb, fstab...) stays with the team</td></tr><tr><td>Capture the configuration before changing anything</td><td><code>config.json</code> is written before any change</td></tr><tr><td>One machine at a time until the procedure is proven</td><td>The script works on a single VM per run</td></tr></tbody></table></div>
+<h3>Differences from the playbook</h3>
+<div class="tbl"><table class=""><thead><tr><th>Playbook</th><th>Script</th></tr></thead><tbody><tr><td>On-demand backup or snapshot as a rollback point</td><td>Full snapshots only (backup stays manual)</td></tr><tr><td>Explicit restore of Hybrid Benefit, tags, extensions, identity, backup, locks</td><td>Hybrid Benefit and tags are restored; the rest stays manual and is listed</td></tr><tr><td>Network: new NIC, original IP transferred, placeholder on the old one</td><td>Same; the placeholder is chosen automatically (first free IP of the subnet)</td></tr><tr><td>Validation: platform, guest, application</td><td>The platform part is automatic; guest and application stay with the team</td></tr><tr><td>Rollback</td><td>Guided (section 6); manual actions are not undone</td></tr><tr><td>Decommissioning with locks and retention</td><td>Not in the script: done by hand after sign-off</td></tr></tbody></table></div>
+<h3>Known limits</h3>
+<ul>
+<li>The script verifies that <b>Azure created</b> what is planned, not that the operating system boots and the application works. This, and in particular the start-up of a Gen1 VM on a v2 size, is checked in the tests.</li>
+<li>The <b>security type</b> of the new OS disk is inherited from the snapshot (it cannot be set when copying): if it turns out different the script warns you.</li>
+<li>The <b>boot diagnostics</b> of the new VM are always managed by Azure; the screenshot is looked at in the portal.</li>
+<li>During the migration disks and snapshots exist twice: the storage cost doubles until the clean-up.</li>
+<li>The script works on one VM at a time (reading the list from a file is a future evolution).</li>
+<li>The rollback deletes the new VM: anything attached to it by hand has to be done again.</li>
+<li>The first real cases must be done <b>one at a time and checked thoroughly</b>, as the playbook says, before going in series.</li>
+</ul>
+</section>
+<section id="trouble"><h2>11. Troubleshooting</h2><div class="tbl"><table class=""><thead><tr><th>What you see</th><th>Probable cause</th><th>What to do</th></tr></thead><tbody><tr><td><code>Required module &#39;Az.Compute&#39; is not installed</code></td><td>Az modules missing, or PowerShell 5</td><td>Open <code>pwsh</code> (PowerShell 7) and run <code>Install-Module Az -Scope CurrentUser</code></td></tr><tr><td><code>...without authenticating through MFA</code> with the <code>Connect-AzAccount ... -ClaimsChallenge</code> command</td><td>The tenant requires MFA for changes and the session has none</td><td>Nothing: the script signs in again and retries. To anticipate it: <code>-RequireMfa</code></td></tr><tr><td><code>VM &#39;x&#39; not found in this subscription.</code></td><td>Wrong name or wrong subscription</td><td>Check the name and the subscription you chose</td></tr><tr><td>The size list is all grey</td><td>Quota, region/zone or generation</td><td>Read the reason next to each size (section 4)</td></tr><tr><td><code>No free IP address available in subnet</code></td><td>Subnet is full</td><td>Free an address</td></tr><tr><td><code>NAMES ALREADY IN USE</code></td><td>An earlier attempt was not cleaned up</td><td>Roll that attempt back (if the <code>migration</code> folder is there) or remove the resources by hand</td></tr><tr><td>The menu <code>A MIGRATION OF THIS VM ALREADY EXISTS</code> appears and you did not expect it</td><td>The <code>migration</code> folder holds the state of an earlier attempt on a VM with the same name</td><td>Check the state shown; if the VM is another one, use another folder with <code>-WorkRoot</code></td></tr><tr><td>No resume menu after an error</td><td>The script was launched from a different folder</td><td>Launch it again from the same folder or with the same <code>-WorkRoot</code></td></tr><tr><td><code>Folder ... belongs to a different VM</code></td><td>The folder belongs to a VM with the same name in another subscription or resource group</td><td>Use another <code>-WorkRoot</code></td></tr><tr><td><code>GOLDEN RULE: ... not deallocated</code></td><td>Both VMs appear to be running: the script refuses to go on</td><td>Switch off (deallocate) the VM that must not run, then retry</td></tr><tr><td><code>New OS disk security type is ...</code> (warning)</td><td>The new disk did not inherit the same security type</td><td>Check the VM in the portal before using it</td></tr><tr><td>A <code>FAIL</code> in the checks</td><td>A real difference between the new VM and the recorded configuration</td><td>Fix it by hand and use <code>V</code>, or roll back</td></tr><tr><td>The window was closed during the deployment</td><td>Interruption</td><td>Launch again from the same folder and choose <code>R</code></td></tr></tbody></table></div></section>
+<section id="checklist"><h2>12. Operator checklist</h2>
+<div class="cols3">
+<div><h3>Before</h3><ul class="chk">
+<li>PowerShell 7 and Az modules ready</li><li>Permissions on the resource groups</li><li>Window at least 110 characters wide</li><li>Work folder chosen (always the same for this VM)</li>
+<li>Guest manual checks done (temp disk, DHCP, clean reboot)</li><li>Owner informed, change window agreed</li><li>DNS, firewall and allow-lists noted for a possible rollback</li>
+<li>VM extensions noted, with settings and keys</li><li>Backup: you know how you will enable it afterwards</li><li>Drive letters and mount points noted</li></ul></div>
+<div><h3>During</h3><ul class="chk">
+<li>Do not close the window</li><li>If it stops: read the message, do not rerun blindly</li><li>If MFA appears: complete it in the browser</li><li>Resume: same folder, choose <code>R</code></li>
+<li>Any doubt: roll back (<code>B</code>), as long as the original VM exists</li></ul></div>
+<div><h3>After</h3><ul class="chk">
+<li>Original VM kept off for the whole test phase</li><li>Zero <code>FAIL</code> in the checks</li><li>Guest and application tests done by the owner</li>
+<li>Extensions, identity, load balancer, DNS, monitoring restored by hand</li><li>Sign-off obtained</li><li>Backup enabled on the new VM</li>
+<li>Clean-up by hand: VM &rarr; NIC &rarr; disks &rarr; snapshots (after retention)</li><li>Inventory updated</li></ul></div>
+</div>
+</section>
+</div>
+</body>
+</html>
