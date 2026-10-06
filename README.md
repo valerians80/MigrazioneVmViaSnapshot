@@ -26,6 +26,24 @@ The script never touches the guest OS. Temp-disk remediation and every in-guest 
 
 The size mapping and the extension skip lists are at the top of the script.
 
+### MFA (Azure refuses changes without it)
+
+Some tenants make Azure refuse any create/update/delete unless the sign-in carries the MFA (the error says
+`...without authenticating through MFA` and prints a `Connect-AzAccount ... -ClaimsChallenge "<base64>"` command).
+
+- **Automatic:** if that happens during the deployment, the script signs in again with the claims Azure printed
+  (a browser window opens), then retries the step that was refused. Nothing is lost: steps are checkpointed.
+- **At the start:** pass `-RequireMfa` to sign in with the MFA claim before anything else, so the MFA is done up front
+  (`-ClaimsChallenge <value>` does the same with the exact value from Azure's own message, base64 or raw JSON).
+  This forces a new sign-in instead of reusing the current session.
+
+```powershell
+.\Invoke-VmSkuMigration.ps1 -RequireMfa
+```
+
+The script cannot know in advance whether a tenant enforces it (the only proof is a refused change), which is why
+the automatic retry exists as well.
+
 ## The guided flow
 
 1. The screen is cleared and the script explains what it does and what it does not.

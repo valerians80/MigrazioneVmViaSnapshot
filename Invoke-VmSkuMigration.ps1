@@ -47,6 +47,12 @@
     Folder holding one sub-folder per VM. Default: .\migration
 .PARAMETER Suffix
     Suffix appended to the names of everything the script creates. Default: -mig
+.PARAMETER RequireMfa
+    Signs in at the very start with the claims challenge that Azure's mandatory-MFA enforcement asks for
+    (authentication context "p1"), so the MFA is done before any change. Without it the script signs in normally
+    and, if Azure refuses a change because MFA is missing, it signs in again by itself and retries the step.
+.PARAMETER ClaimsChallenge
+    Same as -RequireMfa but with the value that Azure printed in its own error message (base64 string, or the raw JSON).
 
 .NOTES
     Required modules : Az.Accounts, Az.Compute, Az.Network, Az.Resources
@@ -60,10 +66,15 @@ param(
     [string]$ResourceGroupName,
     [string]$VmName,
     [string]$WorkRoot = (Join-Path -Path (Get-Location).Path -ChildPath 'migration'),
-    [string]$Suffix = '-mig'
+    [string]$Suffix = '-mig',
+    [switch]$RequireMfa,
+    [string]$ClaimsChallenge
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Claims challenge used by Azure's mandatory-MFA enforcement: {"access_token":{"acrs":{"essential":true,"values":["p1"]}}}
+$script:MfaClaims = 'eyJhY2Nlc3NfdG9rZW4iOnsiYWNycyI6eyJlc3NlbnRpYWwiOnRydWUsInZhbHVlcyI6WyJwMSJdfX19'
 
 # ======================================================================================================
 # CONFIGURATION (edit here, nothing below is tenant or customer specific)
@@ -340,8 +351,34 @@ function Get-PhaseStatus {
     return ''
 }
 
+function ConvertTo-ClaimsValue {
+    # Accepts the base64 string printed by Azure or the raw JSON, returns the base64 form.
+    param([string]$Value)
+    if ($Value -and $Value.TrimStart().StartsWith('{')) { return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Value)) }
+    return $Value
+}
+
+function Get-ClaimsChallengeFromMessage {
+    # Azure's MFA refusal contains: Connect-AzAccount -Tenant ... -ClaimsChallenge "<base64>"
+    param([string]$Message)
+    $m = [regex]::Match($Message, 'ClaimsChallenge\s+"?([A-Za-z0-9+/=_-]{20,})"?')
+    if ($m.Success) { return $m.Groups[1].Value }
+    return $null
+}
+
+function Request-StepUpSignIn {
+    param([Parameter(Mandatory)][string]$Claims)
+    Write-Host ''
+    Write-Host 'Azure asks for a stronger sign-in (MFA) before it accepts changes. A browser window opens: complete the sign-in.' -ForegroundColor Yellow
+    Write-Log 'Azure requested a claims challenge (MFA): signing in again' 'WARN'
+    $ctx = Get-AzContext
+    Connect-AzAccount -Tenant $ctx.Tenant.Id -ClaimsChallenge $Claims | Out-Null
+    Set-AzContext -SubscriptionId $script:SubscriptionId -Tenant $script:TenantId | Out-Null
+}
+
 function Invoke-Step {
     # Runs one checkpointed step. A step that already completed is skipped, so a phase can be re-run to resume.
+    # If Azure refuses a change because the MFA is missing, the script signs in again with the requested claims and retries once.
     param(
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][scriptblock]$Action,
@@ -355,7 +392,13 @@ function Invoke-Step {
     $script:CurrentStep = $Name
     if ($script:OnStepChanged) { & $script:OnStepChanged $Name $false }
     try {
-        & $Action
+        try { & $Action }
+        catch {
+            $claims = Get-ClaimsChallengeFromMessage $_.Exception.Message
+            if (-not $claims) { throw }
+            Request-StepUpSignIn -Claims $claims
+            & $Action
+        }
         $script:State.steps[$Name] = (Get-Date).ToString('o')
         Save-State
         $script:CurrentStep = $null
@@ -390,12 +433,19 @@ function Test-Prerequisites {
 function Connect-Target {
     $ctx = Get-AzContext -ErrorAction SilentlyContinue
     $reuse = $false
-    if ($ctx -and $ctx.Account -and (-not $script:TenantId -or $ctx.Tenant.Id -eq $script:TenantId)) {
+    $claims = $null
+    if ($script:ClaimsChallenge) { $claims = ConvertTo-ClaimsValue $script:ClaimsChallenge }
+    elseif ($script:RequireMfa) { $claims = $script:MfaClaims }
+    if (-not $claims -and $ctx -and $ctx.Account -and (-not $script:TenantId -or $ctx.Tenant.Id -eq $script:TenantId)) {
         $reuse = Confirm-Action "Already signed in as '$($ctx.Account.Id)'. Use this session?" -DefaultYes
     }
     if (-not $reuse) {
         Write-Host 'Signing in with Connect-AzAccount ...' -ForegroundColor Cyan
-        if ($script:TenantId) { Connect-AzAccount -Tenant $script:TenantId | Out-Null } else { Connect-AzAccount | Out-Null }
+        $signIn = @{}
+        if ($script:TenantId) { $signIn.Tenant = $script:TenantId }
+        elseif ($claims -and $ctx.Tenant.Id) { $signIn.Tenant = $ctx.Tenant.Id }
+        if ($claims) { $signIn.ClaimsChallenge = $claims; Write-Host 'MFA requested at sign-in: complete it in the browser.' -ForegroundColor Yellow }
+        Connect-AzAccount @signIn | Out-Null
     }
 
     Write-Busy 'Reading the subscriptions you can access...'

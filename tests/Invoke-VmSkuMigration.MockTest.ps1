@@ -60,7 +60,7 @@ $global:Az.vms['vm1'] = [pscustomobject]@{
 $global:CurSub = 's1'
 function Get-AzContext { O @{ Account = (O @{ Id = 'tester@x' }); Tenant = (O @{ Id = 't1' }); Subscription = (O @{ Id = $global:CurSub; Name = 'sub' }) } }
 function Set-AzContext { param($SubscriptionId, $Tenant) Rec "ctx $SubscriptionId"; $global:CurSub = $SubscriptionId; O @{ Account = (O @{ Id = 'tester@x' }) } }
-function Connect-AzAccount { param($Tenant) Rec 'connect' }
+function Connect-AzAccount { param($Tenant, $ClaimsChallenge) if ($ClaimsChallenge) { Rec "connect claims $ClaimsChallenge" } else { Rec 'connect' } }
 function Get-AzSubscription { param($TenantId) @(O @{ Id = 's1'; Name = 'test-sub'; State = 'Enabled'; TenantId = 't1' }) }
 function Get-AzVM { param($ResourceGroupName, $Name, [switch]$Status)
     if (-not $Name) { return @($global:Az.vms.Values) }
@@ -78,7 +78,9 @@ function New-AzDisk { param($ResourceGroupName, $DiskName, $Disk) Rec "new-disk 
     $global:Az.disks[$DiskName] }
 function Remove-AzDisk { param($ResourceGroupName, $DiskName, [switch]$Force) Rec "remove-disk $DiskName"; $global:Az.disks.Remove($DiskName) }
 function New-AzSnapshotConfig { param($SourceUri, $Location, $CreateOption, $SkuName, $Tag, $HyperVGeneration) @{ src = $SourceUri } }
-function New-AzSnapshot { param($ResourceGroupName, $SnapshotName, $Snapshot) Rec "new-snap $SnapshotName"; $global:Az.snaps[$SnapshotName] = O @{ Name = $SnapshotName; Id = "$sub/Microsoft.Compute/snapshots/$SnapshotName" }; $global:Az.snaps[$SnapshotName] }
+function New-AzSnapshot { param($ResourceGroupName, $SnapshotName, $Snapshot)
+    if ($global:ClaimsFailOnce) { $global:ClaimsFailOnce = $false; throw "Resource '$SnapshotName' was disallowed by Azure: You are receiving this error because you tried to create, update or delete Azure resources without authenticating through MFA.`n`nConnect-AzAccount -Tenant (Get-AzContext).Tenant.Id -ClaimsChallenge `"eyJhY2Nlc3NfdG9rZW4iOnsiYWNycyI6eyJlc3NlbnRpYWwiOnRydWUsInZhbHVlcyI6WyJwMSJdfX19`"" }
+    Rec "new-snap $SnapshotName";$global:Az.snaps[$SnapshotName] = O @{ Name = $SnapshotName; Id = "$sub/Microsoft.Compute/snapshots/$SnapshotName" }; $global:Az.snaps[$SnapshotName] }
 function Get-AzSnapshot { param($ResourceGroupName, $SnapshotName) $s = $global:Az.snaps[$SnapshotName]; if (-not $s) { throw "ResourceNotFound snap" }; $s }
 function Remove-AzSnapshot { param($ResourceGroupName, $SnapshotName, [switch]$Force) Rec "remove-snap $SnapshotName"; $global:Az.snaps.Remove($SnapshotName) }
 function Get-AzNetworkInterface { param($ResourceGroupName, $Name) $n = $global:Az.nics[$Name]; if (-not $n) { throw "ResourceNotFound nic $Name" }; $n }
@@ -156,9 +158,13 @@ function Assert-NoLeftoverAnswers { if ($global:Answers.Count) { throw "Unused s
 # ================= RUN 1: new migration, deployment fails at VM creation =================
 Write-Host "`n===== RUN 1: new migration (VM creation fails once) =====" -ForegroundColor Cyan
 $global:FailVmOnce = $true
+$global:ClaimsFailOnce = $true          # Azure refuses the first snapshot asking for MFA: the script must sign in again and retry
 Say 'y', 'y', '', 'ACKNOWLEDGE', 'y'   # reuse session, manual checks done, accept proposed size, acknowledge, proceed
 Start-Migration
 Assert-NoLeftoverAnswers
+Assert ($global:Az.calls -contains 'connect claims eyJhY2Nlc3NfdG9rZW4iOnsiYWNycyI6eyJlc3NlbnRpYWwiOnRydWUsInZhbHVlcyI6WyJwMSJdfX19') 'MFA refusal: signed in again with the claims Azure asked for'
+Assert ($global:Az.snaps.ContainsKey('os1-snap-os-mig')) 'MFA refusal: the step was retried and succeeded'
+Assert ((ConvertTo-ClaimsValue '{"a":1}') -eq 'eyJhIjoxfQ==') 'raw JSON claims are converted to base64'
 Assert ($script:Config.targetSku -eq 'Standard_B2s_v2' -and $script:Config.skuFit -eq 'Exact') 'size chosen and recorded'
 Assert ($script:State.placeholders['nic1|ipconfig1'] -eq '10.0.1.50') 'placeholder IP taken automatically'
 Assert ($script:State.steps.ContainsKey('p3.snapshot.os1') -and $script:State.steps.ContainsKey('p3.disk.os1')) 'steps before the failure are checkpointed'
