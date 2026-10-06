@@ -113,6 +113,9 @@ pwsh .\testenv\New-MigrationTestEnvironment.ps1 -Destroy         # removes both 
 
 The script prints the exact command to run the migration against it and saves the deployment in `testenv.json`.
 It can be re-run after a partial failure: tagged resource groups and an existing VNet / NSG are reused.
+To add a second VM to the same environment use a different `-VmName` and `-PrivateIp` (or `-PrivateIp ''` for dynamic);
+the script refuses, before creating anything, if the VM, NIC, public IP or private IP already exist, or if `testenv.json`
+belongs to another environment (then use `-StatePath`, or `-Prefix` for a completely separate one).
 Both resource groups are tagged `purpose=migration-test`; `-Destroy` only deletes groups carrying that tag.
 Run `-Destroy` when finished: a running B2ms VM costs a few cents per hour.
 

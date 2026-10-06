@@ -194,6 +194,25 @@ else {
     @{ Publisher = 'Canonical'; Offer = 'ubuntu-24_04-lts'; Sku = $(if ($Generation -eq 2) { 'server' } else { 'server-gen1' }) }
 }
 
+# --- refuse to touch anything that already exists (a second VM must have its own name, NIC, public IP and private IP) ---
+if (Test-Path $StatePath) {
+    $old = Get-Content -Raw $StatePath | ConvertFrom-Json
+    if ($old.vmResourceGroup -ne $vmRg -or $old.networkResourceGroup -ne $netRg -or $old.subscriptionId -ne $sub.Id) {
+        throw "State file '$StatePath' belongs to another environment ($($old.vmResourceGroup) / $($old.networkResourceGroup)). Use -StatePath for this one, or remove the old environment with -Destroy first."
+    }
+}
+Invoke-InSubscription $sub.Id {
+    $clash = @()
+    if (Get-AzVM -ResourceGroupName $vmRg -Name $VmName -ErrorAction SilentlyContinue) { $clash += "VM '$VmName' already exists" }
+    if (Get-AzNetworkInterface -ResourceGroupName $vmRg -Name $nicName -ErrorAction SilentlyContinue) { $clash += "NIC '$nicName' already exists" }
+    if ($WithPublicIp -and (Get-AzPublicIpAddress -ResourceGroupName $vmRg -Name $pipName -ErrorAction SilentlyContinue)) { $clash += "public IP '$pipName' already exists" }
+    if ($PrivateIp -and (Get-AzVirtualNetwork -ResourceGroupName $netRg -Name $vnetName -ErrorAction SilentlyContinue)) {
+        $probe = Test-AzPrivateIPAddressAvailability -ResourceGroupName $netRg -VirtualNetworkName $vnetName -IPAddress $PrivateIp
+        if (-not $probe.Available) { $clash += "private IP $PrivateIp is already in use (free ones: $(@($probe.AvailableIPAddresses) -join ', '))" }
+    }
+    if ($clash) { throw "Nothing was created. $($clash -join '; '). To add another VM to the same environment use a different -VmName and -PrivateIp (or -PrivateIp '' for dynamic)." }
+}
+
 Write-Host ''
 Write-Host 'Plan:' -ForegroundColor Cyan
 Write-Host "  Tenant        : $TenantId"
