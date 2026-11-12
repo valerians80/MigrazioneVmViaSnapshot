@@ -118,3 +118,11 @@ Eliminato il controllo con `Az.RecoveryServices` (e l'errore `Backup status look
 Lo script le registra (nome, tipo, versione, stato sulla VM vecchia), le mostra nella colonna sinistra e nell'elenco "non gestito"
 (la nuova VM non ne ha nessuna), e lo dice nella prima schermata. Tolti: il passo di ripristino, i controlli sulle estensioni nella
 validazione e le liste `ExtensionsToSkip` / `ExtensionsManual`.
+
+**Eliminazione della sorgente (richiesta cliente, 12/11/2026):** rilanciando lo script su una VM già migrata (migrazione completa) compare
+l'opzione `D`: verifica che la VM nuova esista e che la vecchia non sia accesa, elenca cosa verrà cancellato (VM vecchia, NIC, dischi,
+snapshot della migrazione), avvisa se sono passati meno di `-MinRetentionDays` giorni (default 7; è un avviso, non un blocco) e richiede
+di digitare `ACKNOWLEDGE`. Cancellazione con checkpoint (VM, NIC, dischi, snapshot), non tocca VM nuova, IP pubblico, backup. Dopo non c'è rollback;
+rilanciando lo script sul nome della VM viene detto che la sorgente è già stata eliminata. Test mock: RUN 6. Da provare su Azure reale.
+
+**Rollback e IP dinamico (12/10/2026):** l'IP originale della NIC sorgente torna sempre come **statico**, anche se prima era dinamico.

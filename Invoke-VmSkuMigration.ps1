@@ -19,7 +19,8 @@
       8. deploys: shut down the old VM, snapshots, new disks, IP hand-over, new NIC/VM
       9. runs automatic checks and reminds the tests to do, keeping the old VM switched off
 
-    Running the script again on a VM that already has a migration offers: resume, run the checks again, or roll back.
+    Running the script again on a VM that already has a migration offers: resume, run the checks again, roll back,
+    or - once the migration is complete and tested - delete the source resources.
 
     SCOPE: plain VM recreation only. The replacement VM is created next to the source with the suffix "-mig"
     (VM, NICs, disks). Everything the script does NOT handle (VM extensions, backup, managed identity, load balancer /
@@ -27,9 +28,11 @@
     must be acknowledged before the start; those items are done by hand. Backup and extensions are stated on the
     very first screen.
 
-    NOTHING of the source is ever deleted. The source VM, its NIC and its disks stay in place, deallocated, and its
-    NIC is parked on a placeholder IP. Rollback is a reversal. Removing the old VM, disks and snapshots, and
-    enabling backup on the new VM, are manual steps after sign-off.
+    The migration itself never deletes the source. The source VM, its NIC and its disks stay in place, deallocated,
+    and its NIC is parked on a placeholder IP. Rollback is a reversal. Only when you run the script again on the
+    migrated VM and choose "delete the source" (listed resources, warning if less than -MinRetentionDays days have
+    passed, typed ACKNOWLEDGE) are the source VM, NIC(s), disks and snapshots removed. Enabling backup on the new
+    VM is a manual step.
 
     The script does NOT touch the guest operating system.
 
@@ -48,6 +51,9 @@
     Folder holding one sub-folder per VM. Default: .\migration
 .PARAMETER Suffix
     Suffix appended to the names of everything the script creates. Default: -mig
+.PARAMETER MinRetentionDays
+    Days the source resources should be kept after the migration. The "delete source" option of a migrated VM
+    warns (it does not block) when fewer days have passed. Default: 7
 .PARAMETER RequireMfa
     Signs in at the very start with a fixed claims challenge (authentication context "p1"), so the MFA is done before
     any change. That value was taken from the error message of ONE tenant: it is not guaranteed to be valid in every
@@ -70,6 +76,7 @@ param(
     [string]$VmName,
     [string]$WorkRoot = (Join-Path -Path (Get-Location).Path -ChildPath 'migration'),
     [string]$Suffix = '-mig',
+    [int]$MinRetentionDays = 7,
     [switch]$RequireMfa,
     [string]$ClaimsChallenge
 )
@@ -465,14 +472,27 @@ function Connect-Target {
     Write-Log "Context: $($ctx.Account.Id) | tenant $($sub.TenantId) | subscription $($sub.Name) ($($sub.Id))" 'OK'
 }
 
+function Assert-NotDeletedSource {
+    # The source VM of a finished migration may have been deleted on purpose: say so instead of "not found".
+    param([string]$Name)
+    $f = Join-Path (Join-Path $WorkRoot $Name) 'state.json'
+    if (-not (Test-Path $f)) { return }
+    $old = Get-Content -Raw -Path $f | ConvertFrom-Json -AsHashtable
+    if ($old.sourceDeleted) { throw "VM '$Name' was migrated and its source resources were deleted on $($old.sourceDeleted): there is nothing left to do (the replacement is '$Name$($old.suffix)')." }
+}
+
 function Select-Vm {
-    if ($script:ResourceGroupName -and $script:VmName) { $null = Get-AzVM -ResourceGroupName $script:ResourceGroupName -Name $script:VmName; return }
+    if ($script:ResourceGroupName -and $script:VmName) {
+        try { $null = Get-AzVM -ResourceGroupName $script:ResourceGroupName -Name $script:VmName -ErrorAction Stop }
+        catch { Assert-NotDeletedSource $script:VmName; throw }
+        return
+    }
     while ($true) {
         if (-not $script:VmName) { $script:VmName = Read-Required 'Name of the VM to migrate' }
         Write-Busy 'Looking for the VM in the subscription...'
         $found = @(Get-AzVM | Where-Object { $_.Name -ieq $script:VmName -and (-not $script:ResourceGroupName -or $_.ResourceGroupName -ieq $script:ResourceGroupName) })
         if ($found.Count -eq 1) { $script:ResourceGroupName = $found[0].ResourceGroupName; $script:VmName = $found[0].Name; return }
-        if ($found.Count -eq 0) { Write-Host "VM '$($script:VmName)' not found in this subscription." -ForegroundColor Yellow; $script:VmName = $null; continue }
+        if ($found.Count -eq 0) { Assert-NotDeletedSource $script:VmName; Write-Host "VM '$($script:VmName)' not found in this subscription." -ForegroundColor Yellow; $script:VmName = $null; continue }
         Write-Host "More than one VM is called '$($script:VmName)':" -ForegroundColor Yellow
         for ($i = 0; $i -lt $found.Count; $i++) { Write-Host ('  [{0}] resource group {1} ({2})' -f ($i + 1), $found[$i].ResourceGroupName, $found[$i].Location) }
         while ($true) {
@@ -1320,6 +1340,117 @@ function Invoke-Rollback {
 }
 
 # ======================================================================================================
+# PHASE 6 - DELETE THE SOURCE RESOURCES (after the tests and the sign-off)
+# ======================================================================================================
+
+function Get-MigrationAgeDays {
+    # Whole days since the deployment was completed (phase 3). $null when unknown.
+    param($Phase3At, [datetime]$Now = (Get-Date))
+    if (-not $Phase3At) { return $null }
+    try { return [int][Math]::Floor(($Now - [datetime]$Phase3At).TotalDays) } catch { return $null }
+}
+
+function Get-SourceResourcesToDelete {
+    # Returns the source resources that still exist: VM, NICs, disks and the snapshots taken by the deployment.
+    $c = $script:Config
+    $rg = $c.resourceGroup
+    $items = @()
+    if ((Get-VmPowerState -Rg $rg -Name $c.vmName) -ne 'notfound') { $items += [pscustomobject]@{ Kind = 'VM'; Name = $c.vmName; ResourceGroup = $rg; Key = 'del.vm' } }
+    foreach ($n in $c.nics) {
+        if (Test-ResourceExists { Get-AzNetworkInterface -ResourceGroupName $n.resourceGroup -Name $n.name -ErrorAction Stop }) {
+            $items += [pscustomobject]@{ Kind = 'NIC'; Name = $n.name; ResourceGroup = $n.resourceGroup; Key = "del.nic.$($n.name)" }
+        }
+    }
+    foreach ($d in @($c.osDisk) + @($c.dataDisks)) {
+        $isOs = ($d.name -eq $c.osDisk.name)
+        $tag = if ($isOs) { 'OS disk' } else { "data disk LUN $($d.lun)" }
+        if (Test-ResourceExists { Get-AzDisk -ResourceGroupName $d.resourceGroup -DiskName $d.name -ErrorAction Stop }) {
+            $items += [pscustomobject]@{ Kind = "Disk ($tag)"; Name = $d.name; ResourceGroup = $d.resourceGroup; Key = "del.disk.$($d.name)" }
+        }
+        foreach ($sn in (Get-SnapshotNameCandidates -Disk $d -IsOs $isOs)) {
+            if (Test-ResourceExists { Get-AzSnapshot -ResourceGroupName $d.resourceGroup -SnapshotName $sn -ErrorAction Stop }) {
+                $items += [pscustomobject]@{ Kind = 'Snapshot'; Name = $sn; ResourceGroup = $d.resourceGroup; Key = "del.snap.$sn" }
+            }
+        }
+    }
+    return $items
+}
+
+function Invoke-DeleteSource {
+    # Modifies Azure resources: DELETES the source VM, NIC(s), disks and snapshots. Not reversible.
+    $script:UiActive = $false
+    $script:OnStepChanged = $null
+    Write-Log 'Delete the source resources (modifies Azure resources)' 'STEP'
+    $st = $script:State
+    $c = $script:Config
+    $rg = $c.resourceGroup
+    $newName = Get-TargetName $c.vmName -MaxLength 64
+    if ((Get-PhaseStatus 3) -notin 'done', 'done-with-warnings') { Write-Log 'The migration is not complete: nothing to delete yet.' 'WARN'; return }
+
+    # guard rails: the replacement must exist, the source must be off
+    $newState = Get-VmPowerState -Rg $rg -Name $newName
+    if ($newState -eq 'notfound') { Write-Log "The replacement VM $newName does not exist: refusing to delete the source (use the rollback instead)." 'ERROR'; return }
+    if ((Get-VmPowerState -Rg $rg -Name $c.vmName) -eq 'running') { Write-Log "Source VM $($c.vmName) is running: stop it first. Nothing was deleted." 'ERROR'; return }
+
+    $items = @(Get-SourceResourcesToDelete)
+    if (-not $items.Count) { Write-Log 'No source resource is left.' 'OK'; $st.sourceDeleted = (Get-Date).ToString('o'); Save-State; return }
+
+    $newDiskIds = @((Get-AzVM -ResourceGroupName $rg -Name $newName).StorageProfile | ForEach-Object { @($_.OsDisk.ManagedDisk.Id) + @($_.DataDisks | ForEach-Object { $_.ManagedDisk.Id }) } | Where-Object { $_ })
+    foreach ($d in @($c.osDisk) + @($c.dataDisks)) {
+        if ($d.id -and $d.id -in $newDiskIds) { throw "Safety stop: source disk $($d.name) is attached to the replacement VM." }
+    }
+
+    $age = Get-MigrationAgeDays $st.phases['3'].at
+    Write-Host ''
+    Write-Host 'DELETE THE SOURCE RESOURCES' -ForegroundColor Red
+    Write-Host ('=' * 60) -ForegroundColor DarkGray
+    Write-Host "  Replacement VM kept: $newName ($newState)" -ForegroundColor Green
+    Write-Host '  These resources will be PERMANENTLY DELETED:' -ForegroundColor Red
+    foreach ($i in $items) { Write-Host ("    - {0,-22} {1}   (resource group {2})" -f $i.Kind, $i.Name, $i.ResourceGroup) -ForegroundColor Red }
+    Write-Host ''
+    Write-Host '  After this there is NO rollback. Backup items and recovery points of the old VM are not touched.' -ForegroundColor Yellow
+    Write-Host '  The public IP, already on the new NIC, and the new VM are not touched.' -ForegroundColor Yellow
+    if ($null -eq $age) {
+        Write-Host '  WARNING: the date of the migration is unknown.' -ForegroundColor Yellow
+    }
+    elseif ($age -lt $MinRetentionDays) {
+        Write-Host ''
+        Write-Host "  WARNING: the migration was completed $age day(s) ago, less than the $MinRetentionDays day(s) recommended before deleting the source." -ForegroundColor Red
+    }
+    else { Write-Host "  The migration was completed $age day(s) ago." -ForegroundColor Green }
+    Write-Host ''
+    if (-not (Confirm-Typed 'Delete the source resources listed above' 'ACKNOWLEDGE')) { Write-Host 'Not acknowledged: nothing was deleted.' -ForegroundColor Yellow; return }
+    $st.attestations += @{ type = 'source-delete-acknowledged'; ageDays = $age; count = $items.Count; by = $env:USERNAME; at = (Get-Date).ToString('o') }
+    Save-State
+
+    # order matters: VM first (releases NICs and disks), then NICs, disks, snapshots
+    foreach ($i in $items) {
+        Invoke-Step $i.Key {
+            switch -Wildcard ($i.Kind) {
+                'VM' {
+                    if ((Get-VmPowerState -Rg $i.ResourceGroup -Name $i.Name) -ne 'notfound') { Remove-AzVM -ResourceGroupName $i.ResourceGroup -Name $i.Name -Force | Out-Null }
+                }
+                'NIC' {
+                    if (Test-ResourceExists { Get-AzNetworkInterface -ResourceGroupName $i.ResourceGroup -Name $i.Name -ErrorAction Stop }) { Remove-AzNetworkInterface -ResourceGroupName $i.ResourceGroup -Name $i.Name -Force | Out-Null }
+                }
+                'Disk*' {
+                    if (Test-ResourceExists { Get-AzDisk -ResourceGroupName $i.ResourceGroup -DiskName $i.Name -ErrorAction Stop }) { Remove-AzDisk -ResourceGroupName $i.ResourceGroup -DiskName $i.Name -Force | Out-Null }
+                }
+                'Snapshot' {
+                    if (Test-ResourceExists { Get-AzSnapshot -ResourceGroupName $i.ResourceGroup -SnapshotName $i.Name -ErrorAction Stop }) { Remove-AzSnapshot -ResourceGroupName $i.ResourceGroup -SnapshotName $i.Name -Force | Out-Null }
+                }
+            }
+            Write-Log "Deleted $($i.Kind) $($i.Name)" 'OK'
+        }
+    }
+
+    $st.sourceDeleted = (Get-Date).ToString('o')
+    $st.history += @{ event = 'source-deleted'; at = $st.sourceDeleted; by = $env:USERNAME; ageDays = $age; resources = @($items | ForEach-Object { "$($_.Kind) $($_.Name)" }) }
+    Save-State
+    Write-Log 'Source resources deleted. Remaining by hand: backup of the new VM, extensions, and the cleanup of anything listed as not handled.' 'OK'
+}
+
+# ======================================================================================================
 # SCREEN: current VM (green, left) and new VM (red, right)
 # ======================================================================================================
 
@@ -1512,7 +1643,7 @@ function Show-Intro {
     Write-Host ''
     Write-Host 'What it does not do:'
     Write-Host '  - it never looks inside the guest operating system (those checks are yours)'
-    Write-Host '  - it never deletes the old VM, its NIC, disks or snapshots'
+    Write-Host '  - it never deletes the old VM, its NIC, disks or snapshots during the migration (a separate option, after the tests, does)'
     Write-Host '  - it does not move identity, load balancer membership, availability set or locks:'
     Write-Host '    it lists them before the start and you do them by hand'
     Write-Host ''
@@ -1575,23 +1706,25 @@ function Show-Result {
     Write-Host ''
     Write-Host "KEEP THE SOURCE VM '$($c.vmName)' SWITCHED OFF while you test '$(Get-TargetName $c.vmName -MaxLength 64)'." -ForegroundColor Yellow
     Write-Host 'Both machines share hostname, SID and AD computer account: starting both can break the AD trust.' -ForegroundColor Yellow
-    Write-Host 'After the owner has signed off, the old VM, NIC, disks and snapshots are removed by hand.' -ForegroundColor Yellow
+    Write-Host "After the owner has signed off, run the script again on this VM and choose 'Delete the source resources' (at least $MinRetentionDays days after the migration is recommended)." -ForegroundColor Yellow
     Write-Host ''
 }
 
 function Show-ResumeMenu {
-    # Returns 'resume', 'validate', 'rollback' or 'quit'.
+    # Returns 'resume', 'validate', 'rollback', 'delete-source' or 'quit'.
     $done = (Get-PhaseStatus 3) -in 'done', 'done-with-warnings'
     Show-Screen -Title 'A MIGRATION OF THIS VM ALREADY EXISTS' -RefreshPower -Progress
     Write-Host ''
     if ($done) { Write-Host '  [V] Run the automatic checks again' } else { Write-Host '  [R] Resume the deployment from the last completed step' }
     Write-Host '  [B] Roll back (delete the new VM, give the original IP back to the old VM and start it)'
+    if ($done) { Write-Host '  [D] Delete the source resources (old VM, NICs, disks, snapshots) - after the tests; no rollback afterwards' }
     Write-Host '  [Q] Quit'
     while ($true) {
         $a = (Read-Host 'Choose').Trim().ToUpper()
         if ($a -eq 'Q') { return 'quit' }
         if ($a -eq 'B') { return 'rollback' }
         if ($done -and $a -eq 'V') { return 'validate' }
+        if ($done -and $a -eq 'D') { return 'delete-source' }
         if (-not $done -and $a -eq 'R') { return 'resume' }
     }
 }
@@ -1614,12 +1747,27 @@ function Start-Migration {
         Select-Vm
         Initialize-Workspace
         $action = 'new'
+        if ($script:State.sourceDeleted) {
+            Show-Screen -Title 'SOURCE ALREADY DELETED' -RefreshPower
+            Write-Host ''
+            Write-Host "  The source resources of this VM were deleted on $($script:State.sourceDeleted). Rollback is no longer possible." -ForegroundColor Yellow
+            Write-Host '  Nothing else to do here.'
+            Write-Host ''
+            return
+        }
         if ($script:State.phase3Started) { $action = Show-ResumeMenu }
 
         switch ($action) {
             'quit' { return }
             'rollback' {
                 Invoke-Rollback
+                $script:UiActive = $true
+                Write-Host ''
+                Read-Host 'Press Enter to exit' | Out-Null
+                return
+            }
+            'delete-source' {
+                Invoke-DeleteSource
                 $script:UiActive = $true
                 Write-Host ''
                 Read-Host 'Press Enter to exit' | Out-Null

@@ -238,5 +238,36 @@ Assert-NoLeftoverAnswers
 Assert ((Get-PhaseStatus 4) -eq 'PASS' -and $global:Az.vms['vm1-mig'].Power -eq 'running') 'second migration completed'
 Assert ($global:Az.nics.ContainsKey('nic1') -and $global:Az.disks.ContainsKey('os1') -and $global:Az.vms.ContainsKey('vm1')) 'old resources all still there'
 
+# ================= RUN 6: delete the source resources =================
+Write-Host "`n===== RUN 6: delete the source resources =====" -ForegroundColor Cyan
+Assert ((Get-MigrationAgeDays '2026-01-01T00:00:00' ([datetime]'2026-01-09T12:00:00')) -eq 8) 'age in days'
+Assert ((Get-MigrationAgeDays '2026-01-01T00:00:00' ([datetime]'2026-01-03T00:00:00')) -eq 2) 'age below the minimum'
+Assert ($null -eq (Get-MigrationAgeDays $null)) 'unknown age'
+$global:Az.calls.Clear()
+Say 'y', 'd', 'no', ''           # session, delete-source, wrong confirmation, exit
+Start-Migration
+Assert-NoLeftoverAnswers
+Assert (-not ($global:Az.calls | Where-Object { $_ -like 'remove-*' })) 'not acknowledged: nothing deleted'
+Assert (-not $script:State.sourceDeleted) 'not acknowledged: state untouched'
+# the guard rail: a running source VM must not be deleted
+$global:Az.vms['vm1'].Power = 'running'
+Say 'y', 'd', ''
+Start-Migration
+Assert-NoLeftoverAnswers
+Assert ($global:Az.vms.ContainsKey('vm1')) 'running source VM: refused'
+$global:Az.vms['vm1'].Power = 'deallocated'
+Say 'y', 'd', 'ACKNOWLEDGE', ''  # migration completed a moment ago: warning shown, ACKNOWLEDGE accepted
+Start-Migration
+Assert-NoLeftoverAnswers
+Assert (-not ($global:Az.vms.ContainsKey('vm1') -or $global:Az.nics.ContainsKey('nic1') -or $global:Az.disks.ContainsKey('os1') -or $global:Az.snaps.ContainsKey('os1-snap-os-mig'))) 'source VM, NIC, disks and snapshots deleted'
+Assert ($global:Az.vms.ContainsKey('vm1-mig') -and $global:Az.nics.ContainsKey('nic1-mig') -and $global:Az.disks.ContainsKey('os1-mig')) 'new VM, NIC and disks untouched'
+Assert ($script:State.sourceDeleted) 'deletion recorded in the state'
+try { Assert-NotDeletedSource 'vm1'; $msg = '' } catch { $msg = $_.Exception.Message }
+Assert ($msg -match 'source resources were deleted') 'after the deletion, selecting the VM says so instead of "not found"'
+Say 'y'
+Start-Migration
+Assert-NoLeftoverAnswers
+Assert ($true) 'run on a VM whose source was deleted ends cleanly'
+
 Write-Host "`nALL MOCK TESTS PASSED" -ForegroundColor Green
 Remove-Item $work -Recurse -Force

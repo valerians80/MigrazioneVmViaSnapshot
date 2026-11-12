@@ -7,7 +7,7 @@ playbook (Bv1 -> Bsv2, Fsv2 -> Dlsv6, or any mapping you set). One VM per run, e
 no tenant/subscription/customer values in the code.
 
 **Scope: plain VM recreation.** Anything beyond that is detected, listed and acknowledged before the migration
-starts, then done by hand. **Nothing of the old VM is ever deleted**: it stays in place, deallocated.
+starts, then done by hand. **The migration never deletes the old VM**: it stays in place, deallocated, until you explicitly choose the "delete the source" option (see below).
 
 The script never touches the guest OS. Temp-disk remediation and every in-guest check stay with the team
 (phase 2 asks for an explicit confirmation, phase 4 prints the manual checklist).
@@ -69,12 +69,25 @@ prints in that very error.
 
 If the VM already has a migration, running the script again offers: resume the deployment (checkpoint per step),
 run the automatic checks again, or **roll back** (delete the new VM and NICs, give the original IP (as static, even if it was dynamic) and the public IP
-back to the old NIC, start the old VM).
+back to the old NIC, start the old VM), or **delete the source** (see below).
 
 Naming: VM, NICs and disks get the suffix `-mig`; snapshots are `<disk>-snap-os-mig` (OS disk) and
 `<disk>-snap-lun<N>-mig` (data disks), so the LUN is visible in the name for any manual intervention.
 Per-VM files live in `.\migration\<vmName>\` (`config.json`, `state.json`, `migration.log`, `validation-report.csv`):
 run the script from the same folder to find them again.
+
+### Deleting the source resources (after the tests)
+
+Once the migration is complete, tested and signed off, run the script again on the same VM and choose `D`:
+
+- the new VM must exist and the old one must not be running, otherwise the script refuses;
+- it lists exactly what will be deleted: the old VM, its NIC(s), its disks and the snapshots taken by the migration;
+- if fewer than `-MinRetentionDays` (default 7) days have passed since the migration, it prints a warning (it does not block);
+- you must type `ACKNOWLEDGE`; anything else cancels and nothing is deleted;
+- deletion is checkpointed (VM, then NICs, disks, snapshots): if a step fails, choose `D` again and it continues.
+
+The new VM, its NICs and disks and the public IP are never touched. **After this there is no rollback.** Backup items and
+recovery points of the old VM are not touched either: deal with them by hand.
 
 ## What the script recreates
 
@@ -100,13 +113,13 @@ IPv6 configuration or no free placeholder IP exists.
 
 ## After a successful migration (manual)
 
-Install the extensions on the new VM, then after the owner's formal sign-off: remove the old VM, NIC, disks and
-snapshots (default retention 14 days), and enable backup on the new VM once the old backup item is dealt with.
+Install the extensions on the new VM, then after the owner's formal sign-off: delete the source resources with option `D`
+(or by hand), and enable backup on the new VM once the old backup item is dealt with.
 
 ## Safety rules enforced by the script
 
 - Source and replacement VM are never both allowed to run (checked before creating the replacement and before starting the source).
-- The script only deletes resources it created itself, and only in rollback.
+- The migration and the rollback only delete resources the script created itself. The source is deleted only by option `D`, after a typed `ACKNOWLEDGE`.
 - The deployment does not start without the manual-checks confirmation, the acknowledgement and the final Y/N.
 
 ## Known limits

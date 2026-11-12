@@ -69,7 +69,7 @@ figcaption{font-weight:600;display:flex;gap:10px;align-items:baseline;flex-wrap:
 <nav class="toc" aria-label="Contents"><b>Contents</b><ol><li><a href="#overview">What it does and does not do</a></li><li><a href="#before">Before you start</a></li><li><a href="#walkthrough">The walkthrough, screen by screen</a></li><li><a href="#blocks">When the script stops before starting</a></li><li><a href="#interruptions">Interruptions, MFA and resume</a></li><li><a href="#existing">A VM already migrated: re-check and rollback</a></li><li><a href="#files">Work folder and files</a></li><li><a href="#checks">The automatic checks</a></li><li><a href="#after">After the migration</a></li><li><a href="#rules">Safety rules, the playbook and limits</a></li><li><a href="#trouble">Troubleshooting</a></li><li><a href="#checklist">Operator checklist</a></li></ol></nav>
 <section id="overview"><h2>1. What it does and does not do</h2>
 <p><code>Invoke-VmSkuMigration.ps1</code> moves <b>one Azure VM at a time</b> to a new size (for example Bv1 &rarr; Bsv2, Fsv2 &rarr; Dlsv6) by rebuilding it from snapshots,
-as described in the size conversion playbook. It works on Azure only: it <b>never goes inside the guest operating system</b> and it <b>never deletes anything</b>.</p>
+as described in the size conversion playbook. It works on Azure only: it <b>never goes inside the guest operating system</b> and it <b>deletes nothing during the migration</b> (the source is removed only by the separate, explicit option described in section 6).</p>
 <p>In short: it shuts the VM down, snapshots every disk, creates a new VM with the <code>-mig</code> suffix that takes over the <b>same private IP</b>
 (and the public IP, if there is one), and leaves the original VM <b>switched off and untouched</b>. If something goes wrong, the rollback brings the original VM back in a few minutes.</p>
 <div class="tbl"><table class=""><thead><tr><th>The script handles</th><th>Left to you (the script lists it before it starts)</th></tr></thead><tbody><tr><td><ul><li>New VM: chosen size, zone, security type, generation, license (Hybrid Benefit), tags, marketplace plan</li><li>Disks: new disks from full snapshots, same SKU, size, zone, LUN and caching</li><li>NIC(s) with the original private IP (static), NSG, ASG, accelerated networking, DNS</li><li>Original public IP: detached from the old NIC and attached to the new one</li><li>Automatic checks on the Azure side</li><li>Rollback</li></ul></td><td><ul><li><b>Backup</b>: the new VM is not protected, you enable it by hand after validation</li><li><b>Extensions</b>: none is installed, the old VM&#39;s list is shown</li><li>Managed identities (system and user-assigned), role assignments, Key Vault policies</li><li>Load balancer, application gateway, NAT rules</li><li>Availability set and proximity placement group</li><li>Locks, DCR associations (monitoring), capacity reservation</li><li>DNS, firewall, allow-lists and every check inside the VM</li><li>Deleting the old VM, its NIC, disks and snapshots</li></ul></td></tr></tbody></table></div>
@@ -107,7 +107,7 @@ What this script does, for ONE VM:
 
 What it does not do:
   - it never looks inside the guest operating system (those checks are yours)
-  - it never deletes the old VM, its NIC, disks or snapshots
+  - it never deletes the old VM, its NIC, disks or snapshots during the migration (a separate option, after the tests, does)
   - it does not move identity, load balancer membership, availability set or locks:
     it lists them before the start and you do them by hand
 
@@ -501,7 +501,7 @@ Choose: <span class="in">R</span></pre></div><div class="fd">Running the script 
 </section>
 <section id="existing"><h2>6. A VM already migrated: re-check and rollback</h2>
 <p>Running the script again on the name of a VM that already has a migration in progress or completed (from the same folder) <b>does not start over</b>: it shows the state and offers a menu.</p>
-<div class="tbl"><table class=""><thead><tr><th>Situation</th><th>Menu options</th></tr></thead><tbody><tr><td>Deployment interrupted</td><td><code>R</code> resume &middot; <code>B</code> rollback &middot; <code>Q</code> quit</td></tr><tr><td>Deployment completed</td><td><code>V</code> re-check &middot; <code>B</code> rollback &middot; <code>Q</code> quit</td></tr><tr><td>After a rollback</td><td>No menu: the state is cleared and a new run starts from scratch</td></tr></tbody></table></div>
+<div class="tbl"><table class=""><thead><tr><th>Situation</th><th>Menu options</th></tr></thead><tbody><tr><td>Deployment interrupted</td><td><code>R</code> resume &middot; <code>B</code> rollback &middot; <code>Q</code> quit</td></tr><tr><td>Deployment completed</td><td><code>V</code> re-check &middot; <code>B</code> rollback &middot; <code>D</code> delete the source &middot; <code>Q</code> quit</td></tr><tr><td>After a rollback</td><td>No menu: the state is cleared and a new run starts from scratch</td></tr></tbody></table></div>
 <figure><figcaption><span class="fn">Screen 21</span>Re-checking a completed migration</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="c">A MIGRATION OF THIS VM ALREADY EXISTS</span>
 <span class="d">===================================================================================================</span>
 <span class="g">CURRENT VM - DEALLOCATED (off)                            </span><span class="d"> | </span><span class="r">NEW VM - RUNNING                                          </span>
@@ -567,9 +567,29 @@ Also delete the new disks and snapshots created by the deployment (needed to ret
 <span class="g">(history). Run the script again to start a new migration.</span>
 
 Press Enter to exit: <span class="in"></span></pre></div><div class="fd">The rollback stops and <b>deletes the new VM and its NICs</b>, gives the original VM&#39;s NIC its private IP and its public IP back, and starts the original VM. First it checks that the new VM is off: it never lets the two machines run together. It asks for the reason of the rollback (kept in the log and in <code>state.json</code>) and whether to delete the new disks and snapshots as well.</div></figure><figure><figcaption><span class="fn">Screen 23</span>Rollback when no deployment was started</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="y">Nothing to roll back: the deployment never started.</span></pre></div></figure>
-<h3>What the rollback does and does not do</h3>
+<h3>Deleting the source resources (after the tests)</h3>
+<p>When the migration is complete and the owner has signed off, choose <code>D</code>. The script checks that the new VM exists and the old one is not running, lists <b>exactly</b> what it is going to delete (old VM, its NIC(s), its disks, the snapshots taken by the migration), warns if fewer than 7 days have passed since the migration (<code>-MinRetentionDays</code> changes the number; it is a warning, not a block) and asks you to type <code>ACKNOWLEDGE</code>. Anything else cancels and nothing is deleted.</p>
+<figure><figcaption><span class="fn">Screen 22b</span>Deleting the source resources</figcaption><div class="term"><div class="termbar"><i></i><i></i><i></i><b>PowerShell 7</b></div><pre><span class="r">DELETE THE SOURCE RESOURCES</span>
+<span class="d">============================================================</span>
+<span class="g">  Replacement VM kept: srv-app01-mig (running)</span>
+<span class="r">  These resources will be PERMANENTLY DELETED:</span>
+<span class="r">    - VM                     srv-app01   (resource group rg-app-prod)</span>
+<span class="r">    - NIC                    nic-srv-app01   (resource group rg-app-prod)</span>
+<span class="r">    - Disk (OS disk)         srv-app01-osdisk   (resource group rg-app-prod)</span>
+<span class="r">    - Snapshot               srv-app01-osdisk-snap-os-mig   (resource group rg-app-prod)</span>
+<span class="r">    - Disk (data disk LUN 0) srv-app01-data0   (resource group rg-app-prod)</span>
+<span class="r">    - Snapshot               srv-app01-data0-snap-lun0-mig   (resource group rg-app-prod)</span>
+<span class="r">    - Disk (data disk LUN 1) srv-app01-data1   (resource group rg-app-prod)</span>
+<span class="r">    - Snapshot               srv-app01-data1-snap-lun1-mig   (resource group rg-app-prod)</span>
+
+<span class="y">  After this there is NO rollback. Backup items and recovery points of the old VM are not touched.</span>
+<span class="y">  The public IP, already on the new NIC, and the new VM are not touched.</span>
+
+<span class="r">  WARNING: the migration was completed 3 day(s) ago, less than the 7 day(s) recommended before deleting the source.</span>
+
+Delete the source resources listed above (type 'ACKNOWLEDGE' to confirm, anything else cancels): <span class="in">ACKNOWLEDGE</span></pre></div><div class="fd">Order: old VM, then its NICs, disks and snapshots, each step checkpointed (if one fails, choose <code>D</code> again and it continues). The new VM, its NICs and disks and the public IP are never touched. <b>After this there is no rollback.</b> Backup items and recovery points of the old VM stay as they are: deal with them by hand.</div></figure><h3>What the rollback does and does not do</h3>
 <div class="tbl"><table class=""><thead><tr><th>It does</th><th>It does not</th></tr></thead><tbody><tr><td><ul><li>Stops and deletes the new VM and its NICs (freeing the IPs, the public one included)</li><li>Gives the original NIC its private IP back (always as static, even if it was dynamic) and its public IP</li><li>Starts the original VM, after checking that the new one is off</li><li>On request, deletes the new disks and snapshots (needed to redo the migration with the same names)</li><li>Clears the state: you can start again from scratch</li></ul></td><td><ul><li>Does not undo what was done <b>by hand</b> on the new VM (identity, load balancer pools, backup, extensions, DNS, firewall): the final checklist reminds you</li><li>Does not touch the original VM except to bring it back as it was</li><li>Never deletes anything of the original VM</li></ul></td></tr></tbody></table></div>
-<div class="callout note"><b>When it can be done</b><div>As long as the original VM and its resources exist. Since the script never deletes them, the rollback stays possible until you remove them yourself, after sign-off.</div></div>
+<div class="callout note"><b>When it can be done</b><div>As long as the original VM and its resources exist. The migration never deletes them, so the rollback stays possible until you choose the &ldquo;delete the source&rdquo; option (or remove them yourself), after sign-off.</div></div>
 </section>
 <section id="files"><h2>7. Work folder and files</h2>
 <p>For every VM the script creates a folder under <code>migration</code> (in the folder you launch it from, or under <code>-WorkRoot</code>).</p>
@@ -624,10 +644,10 @@ Press Enter to exit: <span class="in"></span></pre></div><div class="fd">The rol
 <li><b>Do by hand what is left</b> on the new VM, from the list shown at the end: extensions (with their settings and keys), managed identity and roles, load balancer pools, availability set (it cannot be added after creation), DNS, firewall, monitoring.</li>
 <li><b>Backup</b>: enable it on the new VM when the old one and its backup item have been dealt with. The restore points of the old VM cannot be transferred.</li>
 <li><b>Formal sign-off</b> from the application owner.</li>
-<li><b>Clean-up by hand</b>, only after sign-off and in this order: original VM &rarr; its NIC &rarr; (after the retention period, 14 days unless asked otherwise) original disks &rarr; snapshots. Before deleting the original VM check that its disks are not set to be deleted with the VM.</li>
+<li><b>Clean-up</b>, only after sign-off: run the script again on the VM and choose <code>D</code> (it deletes the old VM, NICs, disks and snapshots, with a warning if less than 7 days have passed). If you prefer to do it by hand, in this order: original VM &rarr; its NIC &rarr; (after the retention period, 14 days unless asked otherwise) original disks &rarr; snapshots. Before deleting the original VM check that its disks are not set to be deleted with the VM.</li>
 <li><b>Inventory</b>: update size and configuration.</li>
 </ol>
-<div class="callout stop"><b>If something is wrong</b><div>The rollback is available as long as the original VM exists. After you delete the original VM there is no automatic way back.</div></div>
+<div class="callout stop"><b>If something is wrong</b><div>The rollback is available as long as the original VM exists. After you delete the original VM (with option <code>D</code> or by hand) there is no automatic way back.</div></div>
 </section>
 <section id="rules"><h2>10. Safety rules, the playbook and limits</h2>
 <h3>The playbook golden rules and how the script applies them</h3>
